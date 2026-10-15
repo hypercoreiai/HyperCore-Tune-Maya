@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""HyperCore-Tune/bayesian_tune.py - Bayesian (TPE) tuning of the Strata engine.
+"""HyperCore-Tune-Maya/bayesian_tune.py - Bayesian (TPE) tuning of the Project Maya engine.
 
-Searches the dimensions the brief names - vram, pcie, ple-io, kv, kvgrow, hostcore,
-affinity, worker, tail, draft-floor - against one of three user-selected objectives:
+Searches the dimensions the GLM engine exposes - vram, pcie, pcie-mode, ple-io, kv,
+kv-streaming, host-worker, pool workers, prompt-cache, draft-floor - against one of three
+user-selected objectives:
 
     --prefill   maximise prompt tokens/s
     --gen       maximise generated tokens/s
@@ -14,12 +15,12 @@ Two search modes:
     staged   one study per layer, other layers frozen at the incumbent best. `layer` in the
              CSV is then the layer under test, which is how tune/max_tune.sh rows are read.
 
-Deliverables, written at the Strata project root as requested:
+Deliverables, written at the Maya project root as requested:
 
-    max_run_<model>.sh     the production launcher for the winning configuration
-    max_run_<model>.json   the winning configuration, its metrics, and every trial
+    run-maya-<model>.sh     the production launcher for the winning configuration
+    maya-<model>.json   the winning configuration, its metrics, and every trial
 
-Run data from previous sweeps is kept in HyperCore-Tune/history/, one file per machine,
+Run data from previous sweeps is kept in HyperCore-Tune-Maya/history/, one file per machine,
 model, objective and context:
 
     <CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
@@ -29,13 +30,14 @@ measured, seeds the TPE sampler with those trials, and keeps drawing until --tri
 unseen configurations have been evaluated. --no-load starts cold; a record from
 different hardware is ignored unless --allow-hardware-mismatch is given.
 
-Run it through the project venv:  ./HyperCore-Tune/max_tune.sh --model q2_0 --gen --cntx 131072
-The Strata root is found from this repository's location, or pinned with --strata-root.
+Run it through the project venv:  ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --gen --cntx 131072
+The Project Maya root is found from this repository's location, or pinned with --maya-root.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import statistics
@@ -75,7 +77,7 @@ from search_space import (
     sample,
     signature,
 )
-from strata_env import abs_path, engine_binary, strata_root
+from maya_env import abs_path, engine_binary, maya_root
 
 OBJECTIVES = ("gen", "prefill", "latency")
 PENALTY = {"gen": 0.0, "prefill": 0.0, "latency": -1e9}  # every score is "higher is better"
@@ -83,6 +85,19 @@ PENALTY = {"gen": 0.0, "prefill": 0.0, "latency": -1e9}  # every score is "highe
 
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+
+
+def run_log_name(results_dir: Path, layer: str, cfg: Config, index: int) -> Path:
+    """The path of one engine log.
+
+    A second-resolution stamp alone is not enough: two sweeps started in the same second
+    would write over each other's log. The configuration's own digest is in the name, so
+    every boot has a file of its own and a later sweep can find it again.
+    """
+    digest = hashlib.sha1(
+        ",".join(f"{key}={cfg[key]}" for key in sorted(cfg)).encode()
+    ).hexdigest()[:10]
+    return results_dir / f"run-{utc_stamp()}-{layer}-{index}-{digest}.log"
 
 
 def signed_score(m: Metrics, objective: str) -> float:
@@ -110,12 +125,12 @@ def frozen_from_args(args: argparse.Namespace) -> dict[str, object]:
         frozen["ple_io"] = str(args.ple_io)
     if getattr(args, "kv", None) is not None:
         frozen["kv"] = str(args.kv)
-    if getattr(args, "kvgrow", None) is not None:
-        frozen["kvgrow"] = str(args.kvgrow)
-    if getattr(args, "host_core", None) is not None:
-        frozen["host_core"] = str(args.host_core)
-    if getattr(args, "affinity", None) is not None:
-        frozen["affinity"] = str(args.affinity)
+    if getattr(args, "kvstream", None) is not None:
+        frozen["kvstream"] = str(args.kvstream)
+    if getattr(args, "hostworker", None) is not None:
+        frozen["hostworker"] = str(args.hostworker)
+    if getattr(args, "pcie_mode", None) is not None:
+        frozen["pcie_mode"] = str(args.pcie_mode)
     if getattr(args, "worker", None) is not None:
         frozen["worker"] = int(args.worker)
     if getattr(args, "tail", None) is not None:
@@ -159,9 +174,9 @@ class TrialRow:
             "pcie": self.cfg["pcie"],
             "ple_io": self.cfg["ple_io"],
             "kv": self.cfg["kv"],
-            "kvgrow": self.cfg["kvgrow"],
-            "hostcore": self.cfg["host_core"],
-            "affinity": self.cfg["affinity"],
+            "kvstream": self.cfg["kvstream"],
+            "hostworker": self.cfg["hostworker"],
+            "pcie_mode": self.cfg["pcie_mode"],
             "worker": self.cfg["worker"],
             "tail": self.cfg["tail"],
             "draft_floor": self.cfg["draft_floor"],
@@ -266,7 +281,7 @@ class Sweeper:
 
         runs: list[Metrics] = []
         for i in range(self.args.repeat):
-            log = self.args.results_dir / f"run-{utc_stamp()}-{layer}-{i}.log"
+            log = self.args.results_dir / run_log_name(self.args.results_dir, layer, cfg, i)
             runs.append(run_config(
                 engine=self.args.engine, args=args, prompt_ids=self.prompt_ids,
                 max_new=self.args.max_new, log_path=log,
@@ -287,7 +302,8 @@ class Sweeper:
         m = row.metrics
         print(f"  trial {len(self.rows):>3} layer={layer} "
               f"vram={cfg['vram']} pcie={cfg['pcie']} ple-io={cfg['ple_io']} kv={cfg['kv']} "
-              f"kvgrow={cfg['kvgrow']} hostcore={cfg['host_core']} affinity={cfg['affinity']} "
+              f"kvstream={cfg['kvstream']} hostworker={cfg['hostworker']} "
+              f"pcie_mode={cfg['pcie_mode']} "
               f"worker={cfg['worker']} tail={cfg['tail']} "
               f"draft-floor={cfg['draft_floor']} -> {m.status} "
               f"gen {m.gen_tok_s:.2f} tok/s prefill {m.prefill_tok_s:.2f} tok/s "
@@ -500,12 +516,12 @@ class Sweeper:
 
     def write_record(self, record: dict[str, Any]) -> Path:
         """The full trial record: every configuration measured, with its metrics."""
-        out = self.args.results_dir / f"max_run_{self.model}.record.json"
+        out = self.args.results_dir / f"maya-{self.model}.record.json"
         out.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         return out
 
     def write_deliverables(self, record: dict[str, Any]) -> tuple[Path, Path]:
-        """Write max_run_<model>.sh and max_run_<model>.json in the project's run-config format.
+        """Write run-maya-<model>.sh and maya-<model>.json in the project's run-config format.
 
         A root-level launcher left by an earlier sweep may belong to another user; a
         PermissionError there must not throw away a finished sweep, so the pair falls
@@ -520,10 +536,11 @@ class Sweeper:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Bayesian (Optuna) tuning of the Strata engine.",
+        description="Bayesian (Optuna) tuning of the Project Maya engine.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model", default="q2_0", help="quant name; names the deliverables")
+    p.add_argument("--model", default="maya-s24",
+                   help="the model to tune (maya-s24, maya-s, maya-m); names the deliverables")
     metric = p.add_mutually_exclusive_group()
     metric.add_argument("--gen", action="store_const", const="gen", dest="objective",
                        help="maximise generation tokens/s")
@@ -553,49 +570,52 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-workers", type=int, default=None, help="cap the pool-workers grid")
     p.add_argument("--pcie", type=float, default=None,
                    help="hold --pcie-frac at this value instead of searching it")
-    p.add_argument("--ple-io", default=None, choices=("direct", "mmap", "ram"), dest="ple_io",
+    p.add_argument("--ple-io", default=None, choices=("direct", "mmap"), dest="ple_io",
                    help="hold --ple-io at this value instead of searching it")
     p.add_argument("--kv", default=None, choices=("q4_0", "k8v4", "int8", "fp16"),
                    help="hold --kv at this value instead of searching it")
-    p.add_argument("--kvgrow", default=None, choices=("0", "1"),
-                   help="hold --kv-grow at 0 or 1 instead of searching it")
-    p.add_argument("--hostcore", "--host-core", default=None, choices=("first", "last"),
-                   dest="host_core",
-                   help="hold --host-core at this value instead of searching it")
-    p.add_argument("--affinity", default=None, choices=("all", "p-cores", "auto"),
-                   help="hold --pool-affinity at this value instead of searching it")
+    p.add_argument("--kvstream", default=None, choices=("on", "off"),
+                   help="hold --kv-streaming at this value instead of searching it")
+    p.add_argument("--hostworker", "--host-worker", default=None, choices=("1", "0"),
+                   dest="hostworker",
+                   help="1 = the host thread joins the CPU pool (the engine's default), "
+                        "0 = --no-host-worker; held constant instead of searched")
+    p.add_argument("--pcie-mode", default=None, choices=("auto", "dma", "kernel", "direct"),
+                   dest="pcie_mode",
+                   help="hold --pcie-mode at this value instead of searching it")
     p.add_argument("--worker", type=int, default=None,
                    help="hold --pool-workers at this value instead of searching it")
-    p.add_argument("--tail", default=None, choices=("0", "1"),
-                   help="hold --prompt-cache-tail at 0 or 1 during the sweep; "
-                        "the flag is never written into the deliverable")
+    p.add_argument("--tail", type=int, default=None,
+                   help="hold --prompt-cache at this number of conversation checkpoints "
+                        "instead of searching it")
     p.add_argument("--draft-floor", "--spec-min-p", type=float, default=None,
                    dest="draft_floor",
                    help="hold --spec-min-p at this value (0.001-1) instead of searching it")
     p.add_argument("--engine", default=None,
                    help="the engine binary to boot; default the one this project built "
-                        "(engine/strata, engine/hypercore, build/...)")
-    p.add_argument("--strata-root", default=None,
-                   help="the Strata checkout to tune and to write the deliverables into; "
-                        "default the repository this file is inside, or $STRATA_ROOT")
-    p.add_argument("--pack", default=None)
-    p.add_argument("--native", default=None)
-    p.add_argument("--ple-gguf", default=None)
-    p.add_argument("--mtp", default=None)
+                        "(build/strata, build-hip/strata)")
+    p.add_argument("--maya-root", default=None,
+                   help="the Maya checkout to tune and to write the deliverables into; "
+                        "default the repository this file is inside, or $MAYA_ROOT")
+    p.add_argument("--pack", default=None,
+                   help="the model pack to run (--glm-pack); default the one this model's "
+                        "pack folder holds")
+    p.add_argument("--dflash", default=None,
+                   help="a DFlash2 drafter to draft with instead of the model's MTP block")
     p.add_argument("--data-dir", default=None,
-                   help="folder holding packs/models/mtp; default the one the installer "
-                        "recorded in the project settings file, then a data folder next to "
-                        "the Strata checkout")
+                   help="folder holding the model packs (Maya-data/models, ...); default the "
+                        "one the installer recorded in the project settings file, then a data "
+                        "folder next to the Maya checkout")
     p.add_argument("--boot-timeout", type=int, default=300)
     p.add_argument("--run-timeout", type=int, default=180)
     p.add_argument("--results-dir", default=str(Path(__file__).resolve().parent / "results"))
     p.add_argument("--history-dir", default=str(Path(__file__).resolve().parent / "history"),
                    help="where run data keyed to this machine is kept")
     p.add_argument("--replay", default=None,
-                   help="re-emit max_run_<model>.sh/.json from a stored record without "
-                        "booting the engine (HyperCore-Tune/results/max_run_<model>.record.json)")
+                   help="re-emit run-maya-<model>.sh/.json from a stored record without "
+                        "booting the engine (HyperCore-Tune-Maya/results/maya-<model>.record.json)")
     p.add_argument("--from-records", action="store_true",
-                   help="rebuild max_run_<model>.sh/.json from the best measured trial in "
+                   help="rebuild run-maya-<model>.sh/.json from the best measured trial in "
                         "the CSVs under --results-dir, without running a sweep")
     p.add_argument("--history-file", default=None,
                    help="load run data from this file instead of the machine-matched one")
@@ -608,19 +628,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         "probing the host (for tests, containers, and a farm of boxes)")
     p.add_argument("--dry-run", action="store_true", help="print the command lines, launch nothing")
     p.add_argument("--no-deliverables", action="store_true",
-                   help="write only the CSV; skip max_run_<model>.sh/.json")
+                   help="write only the CSV; skip run-maya-<model>.sh/.json")
     p.add_argument("--deliverable-dir", default=None,
-                   help="where max_run_<model>.sh/.json go; default the Strata root")
+                   help="where run-maya-<model>.sh/.json go; default the Maya root")
     p.add_argument("--port", type=int, default=None,
                    help="port the generated launcher uses; default the model config's, else 8081")
     p.add_argument("--no-browser", action="store_true",
                    help="the generated launcher leaves out --open")
     args = p.parse_args(argv)
-    if args.strata_root:
-        pinned = abs_path(args.strata_root)
-        os.environ["STRATA_ROOT"] = str(pinned) if pinned is not None else args.strata_root
-        strata_root.cache_clear()
-    for name in ("engine", "pack", "native", "ple_gguf", "mtp", "data_dir",
+    if args.maya_root:
+        pinned = abs_path(args.maya_root)
+        os.environ["MAYA_ROOT"] = str(pinned) if pinned is not None else args.maya_root
+        maya_root.cache_clear()
+    for name in ("engine", "pack", "dflash", "data_dir",
                  "prompt_tokens_file", "results_dir", "history_dir", "replay",
                  "history_file", "deliverable_dir"):
         value = getattr(args, name)
@@ -631,10 +651,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         hw_path = Path(args.hardware).expanduser()
         if hw_path.is_file():
             args.hardware = str(hw_path.resolve())
-    root = strata_root()
+    root = maya_root()
     args.root = root
     if not args.engine:
-        fallback = root / "engine" / ("strata.exe" if os.name == "nt" else "strata")
+        fallback = root / "build" / ("strata.exe" if os.name == "nt" else "strata")
         args.engine = engine_binary(root) or str(fallback)
     args.engine = str(abs_path(args.engine) or Path(args.engine).expanduser().resolve())
     if not args.objective:
@@ -658,9 +678,9 @@ def _hardware(spec: str | None) -> Hardware:
         raw = json.loads(Path(spec).read_text(encoding="utf-8")) if Path(spec).is_file() \
             else json.loads(spec)
     except (OSError, ValueError) as exc:
-        raise SystemExit(f"HyperCore-Tune: --hardware is not valid JSON: {exc}") from exc
+        raise SystemExit(f"HyperCore-Tune-Maya: --hardware is not valid JSON: {exc}") from exc
     if not isinstance(raw, dict):
-        raise SystemExit("HyperCore-Tune: --hardware must be a JSON object")
+        raise SystemExit("HyperCore-Tune-Maya: --hardware must be a JSON object")
     return hardware_from(raw)
 
 
@@ -698,9 +718,9 @@ def best_from_records(results_dir: Path, model: str, objective: str) -> TrialRow
                     "pcie": float(raw["pcie"]),
                     "ple_io": raw["ple_io"],
                     "kv": raw["kv"],
-                    "kvgrow": raw["kvgrow"],
-                    "host_core": raw["hostcore"],
-                    "affinity": raw["affinity"],
+                    "kvstream": raw["kvstream"],
+                    "hostworker": raw["hostworker"],
+                    "pcie_mode": raw["pcie_mode"],
                     "worker": int(raw["worker"]),
                     "tail": raw["tail"],
                     "draft_floor": float(raw["draft_floor"] if raw.get("draft_floor") is not None
@@ -721,7 +741,7 @@ def rebuild_from_records(args: argparse.Namespace, paths: ModelPaths, hw: Hardwa
     row = best_from_records(Path(args.results_dir), args.model, args.objective)
     if row is None:
         raise SystemExit(
-            f"HyperCore-Tune: no measured (status PASS) trial for model {args.model} "
+            f"HyperCore-Tune-Maya: no measured (status PASS) trial for model {args.model} "
             f"objective {args.objective} in {args.results_dir}"
         )
     engine = engine_args(row.cfg, paths.as_dict(), args.cntx, args.max_new, draft_floor_of(args))
@@ -779,12 +799,12 @@ def replay(record_path: Path, args: argparse.Namespace, paths: ModelPaths,
     """
     record = load_history(record_path)
     if record is None:
-        raise SystemExit(f"HyperCore-Tune: {record_path} is not a readable tuning record")
+        raise SystemExit(f"HyperCore-Tune-Maya: {record_path} is not a readable tuning record")
     if not record.get("best") or not record.get("args"):
-        raise SystemExit(f"HyperCore-Tune: {record_path} has no winning configuration to replay")
+        raise SystemExit(f"HyperCore-Tune-Maya: {record_path} has no winning configuration to replay")
     if not record.get("verified", any(t.get("status") == "PASS" for t in record.get("trials", []))):
         raise SystemExit(
-            f"HyperCore-Tune: {record_path} has no measured trial behind its best; "
+            f"HyperCore-Tune-Maya: {record_path} has no measured trial behind its best; "
             "use --from-records to rebuild from the CSVs instead"
         )
     record.setdefault("hardware", hw.to_dict())
@@ -809,25 +829,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     root = args.root
 
-    if args.pack and args.native:
-        paths = ModelPaths(pack=args.pack, native=args.native, ple_gguf=args.ple_gguf or "",
-                          mtp=args.mtp or "")
+    if args.pack:
+        # An explicit --pack wins, but the rest of the model is still looked for: a
+        # tokenizer beside the pack, the shipped expert profile, a drafter.
+        paths = ModelPaths(pack=args.pack)
+        try:
+            extra = resolve_model_paths(root, args.model, args.data_dir)
+        except FileNotFoundError:
+            extra = ModelPaths()
+        for key in ("tokenizer", "expert_profile", "dflash", "prompt_tokens"):
+            if not getattr(paths, key) and getattr(extra, key):
+                setattr(paths, key, getattr(extra, key))
     else:
         paths = resolve_model_paths(root, args.model, args.data_dir)
     if args.pack:
         paths.pack = args.pack
-    if args.native:
-        paths.native = args.native
-    if args.ple_gguf:
-        paths.ple_gguf = args.ple_gguf
-    if args.mtp:
-        paths.mtp = args.mtp
+    if args.dflash:
+        paths.dflash = args.dflash
     if args.prompt_tokens_file:
         paths.prompt_tokens = args.prompt_tokens_file
     if not paths.prompt_tokens:
         raise SystemExit(
-            "HyperCore-Tune: no prompt token file found. Pass --prompt-tokens-file <json with an 'input' list> "
-            "(bench/results/exchange-rotation-token-ids.json is the usual one)."
+            "HyperCore-Tune-Maya: no prompt token file found. Pass --prompt-tokens-file "
+            "<json with an 'input' list>; fixtures/prompt.json in this repository is the "
+            "bundled one."
         )
     args.prompt_tokens_file = paths.prompt_tokens
 
@@ -839,16 +864,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
         value = frozen[p.key]
         if p.kind == "choice" and str(value) not in {str(c) for c in p.choices}:
-            raise SystemExit(f"HyperCore-Tune: frozen {p.key}={value!r} is not one of {p.choices}")
+            raise SystemExit(f"HyperCore-Tune-Maya: frozen {p.key}={value!r} is not one of {p.choices}")
         if p.kind == "int" and not (int(p.low) <= int(value) <= int(p.high)):
             raise SystemExit(
-                f"HyperCore-Tune: frozen {p.key}={value} is outside [{int(p.low)}, {int(p.high)}]")
+                f"HyperCore-Tune-Maya: frozen {p.key}={value} is outside [{int(p.low)}, {int(p.high)}]")
         if p.kind == "float" and not (float(p.low) <= float(value) <= float(p.high)):
             raise SystemExit(
-                f"HyperCore-Tune: frozen {p.key}={value} is outside [{p.low}, {p.high}]")
+                f"HyperCore-Tune-Maya: frozen {p.key}={value} is outside [{p.low}, {p.high}]")
     params = [p for p in params if p.key not in frozen]
     if not params:
-        raise SystemExit("HyperCore-Tune: every dimension is frozen; nothing to search")
+        raise SystemExit("HyperCore-Tune-Maya: every dimension is frozen; nothing to search")
 
     hw = _hardware(args.hardware)
     history_file = Path(args.history_file) if args.history_file else history_path(

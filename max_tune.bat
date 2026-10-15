@@ -1,22 +1,22 @@
 @echo off
-rem HyperCore-Tune\max_tune.bat - Windows 10/11 entry point for the Bayesian (Optuna) sweep.
+rem HyperCore-Tune-Maya\max_tune.bat - Windows 10/11 entry point for the Bayesian (Optuna) sweep.
 rem
-rem   max_tune.bat --model q2_0 --gen      --cntx 131072
-rem   max_tune.bat --model q2_0 --prefill  --cntx 131072 --trials 60
-rem   max_tune.bat --model q2_0 --latency  --mode staged --dry-run
+rem   max_tune.bat --model maya-s24 --gen      --cntx 131072
+rem   max_tune.bat --model maya-s24 --prefill  --cntx 131072 --trials 60
+rem   max_tune.bat --model maya-s24 --latency  --mode staged --dry-run
 rem   max_tune.bat --show-project
 rem   max_tune.bat --install
 rem
-rem Dimensions: vram pcie ple-io kv kvgrow hostcore affinity worker tail draft-floor
+rem Dimensions: vram pcie pcie-mode ple-io kv kvstream hostworker worker tail draft-floor
 rem Freeze any of them with the matching flag (--pcie, --kv, --draft-floor, ...).
 rem --trials counts unseen configurations; repeats in history are redrawn.
-rem --prompt-cache-tail is never written into the deliverable.
+rem --tail is --prompt-cache: the conversation checkpoints the engine keeps.
 rem
-rem This app is standalone. It talks to a Strata checkout found from this folder's
-rem location (nested as <Strata>\HyperCore-Tune, or beside one as %USERPROFILE%\HyperCore-CPP).
+rem This app is standalone. It talks to a Maya checkout found from this folder's
+rem location (nested as <project-maya>\HyperCore-Tune-Maya, or beside one as %USERPROFILE%\HyperCore-Tune-Maya).
 rem Every path the sweep writes is absolute.
 setlocal EnableExtensions
-title HyperCore-Tune
+title HyperCore-Tune-Maya
 cd /d "%~dp0"
 set "HERE=%~dp0"
 
@@ -56,7 +56,7 @@ if errorlevel 1 (
 exit /b 0
 
 :show
-"%PY%" "%HERE%strata_env.py"
+"%PY%" "%HERE%maya_env.py"
 exit /b %ERRORLEVEL%
 
 :findpy
@@ -72,12 +72,12 @@ if exist "%HERE%.venv\Scripts\python.exe" (
     set "PY=%HERE%.venv\Scripts\python.exe"
     goto :eof
 )
-if exist "%HERE%..\Strata\.venv\Scripts\python.exe" (
-    set "PY=%HERE%..\Strata\.venv\Scripts\python.exe"
+if exist "%HERE%..\project-maya\.venv\Scripts\python.exe" (
+    set "PY=%HERE%..\project-maya\.venv\Scripts\python.exe"
     goto :eof
 )
-if exist "%HERE%..\HyperCore\.venv\Scripts\python.exe" (
-    set "PY=%HERE%..\HyperCore\.venv\Scripts\python.exe"
+if exist "%HERE%..\Maya\.venv\Scripts\python.exe" (
+    set "PY=%HERE%..\Maya\.venv\Scripts\python.exe"
     goto :eof
 )
 py -3 -c "import sys" >nul 2>nul

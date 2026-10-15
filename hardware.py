@@ -1,4 +1,4 @@
-"""HyperCore-Tune/hardware.py - the machine a tuning record belongs to.
+"""HyperCore-Tune-Maya/hardware.py - the machine a tuning record belongs to.
 
 A configuration that wins on a 24-core box with a 4090 in a PCIe 4 slot is not a prior
 for a 4-core laptop, so every record the sweep writes carries the hardware it was

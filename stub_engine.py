@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""HyperCore-Tune/stub_engine.py - a deterministic stand-in for engine/hypercore.
+"""HyperCore-Tune-Maya/stub_engine.py - a deterministic stand-in for build/strata.
 
 Speaks the same protocol as the real engine with --serve: it prints an INFO line, says
 "session is up", reads "GEN <max_new> <token ids>" on stdin, answers with a DONE line,
 and stays up until QUIT. The numbers are a smooth function of the swept flags with a
 single interior optimum, which is what a Bayesian sampler needs to show convergence.
 
-    ./HyperCore-Tune/stub_engine.py --serve --max-context 131072 --kv q4_0 --pool-workers 8
+    ./HyperCore-Tune-Maya/stub_engine.py --serve --max-context 131072 --kv q4_0 --pool-workers 8
 """
 from __future__ import annotations
 
@@ -35,43 +35,46 @@ def main() -> int:
     context = int(flags.get("--max-context", "4096"))
     vram = int(flags.get("--vram-reserve-mib", "512"))
     pcie = float(flags.get("--pcie-frac", "0.95"))
+    pcie_mode = flags.get("--pcie-mode", "auto")
     kv = flags.get("--kv", "q4_0")
     ple = flags.get("--ple-io", "direct")
-    host = flags.get("--host-core", "first")
-    affinity = flags.get("--pool-affinity", "all")
+    kvstream = flags.get("--kv-streaming", "on")
+    # --no-host-worker present means the host thread is kept out of the drain.
+    host_out = "--no-host-worker" in flags
     workers = int(flags.get("--pool-workers", "0")) or 16
-    kv_grow = flags.get("--kv-grow", "0")
-    tail = flags.get("--prompt-cache-tail", "0")
+    checkpoints = int(flags.get("--prompt-cache", "6"))
     draft = float(flags.get("--spec-min-p", "0.8"))
 
     if vram < 256 or vram > 2048:
-        print("hypercore error: vram reserve out of range")
+        print("glm error: vram reserve out of range")
         return 1
+    if kv not in ("q4_0", "k8v4", "int8", "fp16"):
+        print(f"glm error: invalid --kv {kv}")
+        return 2
 
     kv_gain = {"k8v4": 1.0, "q4_0": 0.85, "int8": 0.6, "fp16": 0.3}.get(kv, 0.5)
     gen = 110.0
     gen += 45.0 * max(0.0, min(1.0, pcie))
+    gen += {"dma": 8.0, "kernel": 4.0, "direct": 2.0}.get(pcie_mode, 0.0)
     gen += 22.0 * kv_gain
     gen += 6.0 * min(workers, 16)
-    if host == "first":
+    if host_out:
         gen -= 18.0
-    if affinity == "auto":
-        gen += 4.0
-    if kv_grow == "1":
+    if kvstream == "on":
         gen += 3.0
     if vram < 512:
         gen -= 25.0
     gen += 8.0 * max(0.0, 1.0 - abs(draft - 0.5) / 0.5)
     gen = max(20.0, gen)
 
-    prefill = 900.0 * (1.15 if ple == "ram" else 1.0 if ple == "direct" else 0.7)
+    prefill = 900.0 * (1.0 if ple == "direct" else 0.7 if ple == "mmap" else 1.15)
     prefill *= 1.0 + 0.05 * min(context, 131072) / 131072
-    if tail == "1":
-        prefill *= 1.08
+    prefill *= 1.0 + 0.02 * max(0, min(checkpoints, 6))
 
-    print(f"INFO context={context} kv={kv} pool_workers={workers} pcie_frac={pcie:.2f} "
-          f"vram_free_mib={24000 - vram} engine=stub")
-    print("session is up")
+    print(f"INFO context={context} kv={kv} kv_resident={context if kvstream == 'on' else 0} "
+          f"pool_workers={workers} pcie_frac={pcie:.2f} pcie_mode={pcie_mode} "
+          f"vram_free_mib={24000 - vram} engine_kind=glm-fast engine=stub")
+    print("maya generate: session is up (engine stub)")
     sys.stdout.flush()
 
     for line in sys.stdin:
@@ -88,7 +91,7 @@ def main() -> int:
         prompt_ms = 1000.0 * prompt_tokens / prefill
         decode_ms = 1000.0 * max_new / gen
         print(f"DONE {max_new} {prompt_tokens} {prompt_ms:.1f} {decode_ms:.1f} length "
-              f"0 0 0 0 0 0 0 0.0 {prompt_tokens} 0")
+              f"0 0 0 0 0")
         sys.stdout.flush()
     return 0
 

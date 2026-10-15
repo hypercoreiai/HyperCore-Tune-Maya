@@ -1,8 +1,8 @@
-"""HyperCore-Tune/history.py - previous sweeps as priors, keyed to the machine they ran on.
+"""HyperCore-Tune-Maya/history.py - previous sweeps as priors, keyed to the machine they ran on.
 
 One file per (machine, model, objective, context):
 
-    HyperCore-Tune/history/<CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
+    HyperCore-Tune-Maya/history/<CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
 
 The file is a merge of every sweep that ran on that machine: the trials it measured,
 deduplicated by configuration signature, plus a short list of the runs that produced
@@ -34,8 +34,8 @@ from search_space import Config, Param, signature
 
 SCHEMA = "hypercore.tuning_history/1"
 CFG_KEYS: tuple[str, ...] = (
-    "vram", "pcie", "ple_io", "kv", "kvgrow", "host_core", "affinity", "worker", "tail",
-    "draft_floor",
+    "vram", "pcie", "pcie_mode", "ple_io", "kv", "kvstream", "hostworker", "worker",
+    "tail", "draft_floor",
 )
 
 

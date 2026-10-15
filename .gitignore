@@ -2,11 +2,11 @@
 results/
 history/
 *.log
-max_run_*.json
-max_run_*.sh
-max_run_*.bat
-max_run_*.pid
-max_run_*.fifo
+maya-*.json
+run-maya-*.sh
+run-maya-*.bat
+maya-*.pid
+maya-*.fifo
 
 # session bookkeeping, not project source
 .mcp_test_state.json

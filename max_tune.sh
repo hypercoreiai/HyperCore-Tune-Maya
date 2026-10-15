@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# HyperCore-Tune/max_tune.sh - entry point for the Bayesian (Optuna) sweep.
+# HyperCore-Tune-Maya/max_tune.sh - entry point for the Bayesian (Optuna) sweep.
 #
-#   ./HyperCore-Tune/max_tune.sh --model q2_0 --gen      --cntx 131072
-#   ./HyperCore-Tune/max_tune.sh --model q2_0 --prefill  --cntx 131072 --trials 60
-#   ./HyperCore-Tune/max_tune.sh --model q2_0 --latency  --mode staged --dry-run
-#   ./HyperCore-Tune/max_tune.sh --show-project           # print the resolved paths, then exit
-#   ./HyperCore-Tune/max_tune.sh --install               # put optuna into the project venv, then exit
+#   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --gen      --cntx 131072
+#   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --prefill  --cntx 131072 --trials 60
+#   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --latency  --mode staged --dry-run
+#   ./HyperCore-Tune-Maya/max_tune.sh --show-project           # print the resolved paths, then exit
+#   ./HyperCore-Tune-Maya/max_tune.sh --install               # put optuna into the project venv, then exit
 #
 # The objective is one of three user-selected metrics:
 #   --gen      maximise generation tokens/s
@@ -14,24 +14,23 @@
 #   --latency  minimise prompt_ms + decode_ms
 #
 # The dimensions searched are the columns every row is written with:
-#   layer  vram  pcie  ple-io  kv  kvgrow  hostcore  affinity  worker  tail  draft-floor  status
+#   layer  vram  pcie  pcie_mode  ple_io  kv  kvstream  hostworker  worker  tail  draft-floor  status
 #
 # Hold a dimension constant instead of searching it:
-#   --pcie --ple-io --kv --kvgrow --hostcore --affinity --worker --tail --draft-floor
+#   --pcie --pcie-mode --ple-io --kv --kvstream --hostworker --worker --tail --draft-floor
 # --draft-floor is --spec-min-p on the engine, searched in [0.001, 1] unless pinned.
-# --prompt-cache-tail is measured when tail is searched, but never written into the
-# deliverable (the default Strata interface does not accept it).
+# --tail is --prompt-cache: the conversation checkpoints the engine keeps between requests.
 #
 # --trials is unseen configurations: a repeat of a point already in history is redrawn
 # and does not count.
 #
-# Deliverables, at the Strata project root, in the project's own run-config format:
-#   max_run_<model>.sh / .bat   the startup script: serve/server.py with the winning config
-#   max_run_<model>.json        that run config, with the winning engine arguments in "args"
-#   HyperCore-Tune/results/max_run_<model>.record.json   every trial and its metrics
-#   HyperCore-Tune/results/bayesian-<machine>-<model>-<objective>-<stamp>.csv
+# Deliverables, at the Maya project root, in the project's own run-config format:
+#   run-maya-<model>.sh / .bat   the startup script: serve/server.py with the winning config
+#   maya-<model>.json        that run config, with the winning engine arguments in "args"
+#   HyperCore-Tune-Maya/results/maya-<model>.record.json   every trial and its metrics
+#   HyperCore-Tune-Maya/results/bayesian-<machine>-<model>-<objective>-<stamp>.csv
 #
-# Run data is kept per machine in HyperCore-Tune/history/, named
+# Run data is kept per machine in HyperCore-Tune-Maya/history/, named
 #   <CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
 # so a sweep on the same box reuses what it already measured instead of booting again,
 # and keeps drawing until --trials new points have been evaluated.
@@ -40,19 +39,20 @@
 #   --hardware '<json>'         pin the fingerprint instead of probing the host
 #   --replay <record.json>      rewrite the deliverables from a finished sweep, no engine boot
 #   --from-records              rebuild the deliverables from the best measured trial in the
-#                             CSVs under HyperCore-Tune/results/, no engine boot
+#                             CSVs under HyperCore-Tune-Maya/results/, no engine boot
 #
-# The Strata root is resolved in the same order as the Python side: $STRATA_ROOT, then the
-# nearest ancestor of this repository that is a Strata checkout, then a sibling named
-# Strata / HyperCore. A value that starts with ~ is expanded. Every path the sweep writes
-# is absolute, so this script works from ~/Strata/HyperCore-Tune and from ~/HyperCore-CPP.
+# The Project Maya root is resolved in the same order as the Python side: $MAYA_ROOT, then
+# the nearest ancestor of this repository that is a Maya checkout, then a sibling named
+# project-maya / Maya. A value that starts with ~ is expanded. Every path the sweep writes
+# is absolute, so this script works from ~/project-maya/HyperCore-Tune-Maya and from
+# ~/HyperCore-Tune-Maya.
 #
-# The Python side runs under the project venv: setup.sh/install.sh create .venv.
+# The Python side runs under the project venv: maya.py creates .venv.
 # If .venv is missing the system python3 is used and the script says so. optuna lives in
-# this repository's requirements.txt (not Strata's); --install adds it to the venv.
+# this repository's requirements.txt (not Maya's); --install adds it to the venv.
 # On Windows 10/11 the same flags go to max_tune.bat.
 #
-# Requires: bash 4.4+, a free GPU for a real run (stop the server with ./restart.sh first).
+# Requires: bash 4.4+, a free GPU for a real run (stop the server with ./maya.sh first).
 
 set -uo pipefail
 
@@ -75,40 +75,40 @@ abs_path() {
     esac
 }
 
-is_strata_root() {
+is_maya_root() {
     local d="$1"
     [ -f "$d/serve/server.py" ] || return 1
-    [ -f "$d/setup.py" ] || [ -f "$d/CMakeLists.txt" ] || [ -f "$d/src/program/generate.cpp" ]
+    [ -f "$d/maya.py"]  || [ -f "$d/CMakeLists.txt" ] || [ -f "$d/src/program/generate.cpp" ]
 }
 
 find_root() {
     local cand d name
-    if [ -n "${STRATA_ROOT:-}" ]; then abs_path "$STRATA_ROOT"; return 0; fi
+    if [ -n "${MAYA_ROOT:-}" ]; then abs_path "$MAYA_ROOT"; return 0; fi
     if [ -n "${HYPERCORE_ROOT:-}" ]; then abs_path "$HYPERCORE_ROOT"; return 0; fi
     if [ -n "${TUNE_ROOT:-}" ]; then abs_path "$TUNE_ROOT"; return 0; fi
     d="$HERE"
     while [ "$d" != "/" ]; do
         d="$(dirname "$d")"
-        if is_strata_root "$d"; then
+        if is_maya_root "$d"; then
             printf '%s\n' "$d"
             return 0
         fi
     done
-    for name in Strata HyperCore hypercore strata; do
+    for name in project-maya Maya maya Maya-CPP; do
         cand="$HERE/../$name"
-        if is_strata_root "$cand"; then
+        if is_maya_root "$cand"; then
             abs_path "$cand"
             return 0
         fi
     done
     for cand in "$HERE"/../*; do
-        if is_strata_root "$cand"; then
+        if is_maya_root "$cand"; then
             abs_path "$cand"
             return 0
         fi
     done
-    cand="$HERE/../../Strata"
-    if is_strata_root "$cand"; then
+    cand="$HERE/../../project-maya"
+    if is_maya_root "$cand"; then
         abs_path "$cand"
         return 0
     fi
@@ -116,8 +116,8 @@ find_root() {
 }
 
 ROOT="$(find_root)" || {
-    echo "max_tune.sh: no Strata checkout found. Clone HyperCore-Tune inside one, or set" >&2
-    echo "  STRATA_ROOT=/path/to/Strata  (or pass --strata-root)." >&2
+    echo "max_tune.sh: no Project Maya checkout found. Clone HyperCore-Tune-Maya inside one, or set" >&2
+    echo "  MAYA_ROOT=/path/to/project-maya  (or pass --maya-root)." >&2
     exit 4
 }
 VENV="$ROOT/.venv"
@@ -153,23 +153,23 @@ if [ "${1:-}" = "--install" ]; then
 fi
 
 if [ "${1:-}" = "--show-project" ]; then
-    "$PY" "$HERE/strata_env.py"
+    "$PY" "$HERE/maya_env.py"
     exit 0
 fi
 
 if ! "$PY" -c "import optuna" >/dev/null 2>&1; then
     echo "max_tune.sh: $PY cannot import optuna. Install it:" >&2
-    echo "    $PY -m pip install -r HyperCore-Tune/requirements.txt" >&2
-    echo "  or run: ./HyperCore-Tune/max_tune.sh --install" >&2
+    echo "    $PY -m pip install -r HyperCore-Tune-Maya/requirements.txt" >&2
+    echo "  or run: ./HyperCore-Tune-Maya/max_tune.sh --install" >&2
     exit 1
 fi
 
 engine_override=0
 for a in "$@"; do [ "$a" = "--engine" ] && engine_override=1; done
 if [ "$engine_override" = 0 ]; then
-    engine="$("$PY" -c "import sys; sys.path.insert(0, '$HERE'); from strata_env import engine_binary; print(engine_binary())")"
+    engine="$("$PY" -c "import sys; sys.path.insert(0, '$HERE'); from maya_env import engine_binary; print(engine_binary())")"
     if [ -z "$engine" ]; then
-        echo "max_tune.sh: no engine in $ROOT. Build it (./setup.sh or ./install.sh) or pass --engine." >&2
+        echo "max_tune.sh: no engine in $ROOT. Build it (./maya.sh or ./setup.sh) or pass --engine." >&2
         exit 2
     fi
     echo "[*] engine: $engine"

@@ -1,13 +1,12 @@
-"""HyperCore-Tune/engine_runner.py - boot the engine once, measure one request.
+"""HyperCore-Tune-Maya/engine_runner.py - boot the engine once, measure one request.
 
 The engine is not an HTTP server: with --serve it reads "GEN <max_new> <token ids>" on
-stdin and answers on stdout (src/program/generate.cpp:9998). The telemetry we need is in
-two lines it prints:
+stdin and answers on stdout (src/program/generate.cpp). The telemetry we need is in two
+lines it prints:
 
-    INFO logit_bias=1 context=... kv=... pool_workers=... pcie_frac=...   what it applied
+    INFO context=... kv=... kv_resident=... expert_slots=... pcie_share=...   what it applied
     DONE <generated> <prompt> <prompt_ms> <decode_ms> <finish> <drafts accepted>
-         <drafts offered> <reused> <hits> <lookups> <ram blobs> <file blobs> <file MB>
-         <prompt tokens read> <offloaded>                        src/program/generate.cpp:12205
+         <drafts offered> <reused> <hits> <lookups>                        src/program/generate.cpp:1917
 
 Everything is parsed with an explicit field table rather than a loose regex, so a change in
 the DONE line raises instead of silently returning a wrong number.
@@ -90,12 +89,13 @@ def failure_reason(log_text: str) -> str:
     for needle, label in (
         ("does not fit", "NO_VRAM_FOR_MTP: the draft head does not fit at this --vram-reserve-mib"),
         ("out of memory", "NO_VRAM: a device allocation failed"),
-        ("mlock failed", "PLE table could not be pinned; the ram arm degrades to mmap"),
+        ("mlock failed", "PLE table could not be pinned; the mmap arm is all that is left"),
+        ("glm error", "the engine rejected its configuration"),
     ):
         if needle in log_text:
             return label
     for line in reversed(log_text.splitlines()):
-        if line.startswith(("hypercore ", "error")):
+        if line.startswith(("glm error", "maya generate: invalid", "error")):
             return line.strip()
     return "the engine exited with no message"
 
@@ -128,7 +128,7 @@ def run_config(
     no tokens, and a timeout are each recorded as their own status rather than as a crash:
     the optimizer needs a value for every point it tried. `engine` and `log_path` are
     resolved against the current directory before the process starts, so a relative value
-    still works when `cwd` is the Strata root.
+    still works when `cwd` is the Maya root.
     """
     engine = str(Path(engine).expanduser().resolve())
     log_path = Path(log_path).expanduser().resolve()
