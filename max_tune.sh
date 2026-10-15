@@ -78,7 +78,7 @@ abs_path() {
 is_maya_root() {
     local d="$1"
     [ -f "$d/serve/server.py" ] || return 1
-    [ -f "$d/maya.py"]  || [ -f "$d/CMakeLists.txt" ] || [ -f "$d/src/program/generate.cpp" ]
+    [ -f "$d/maya.py" ] || [ -f "$d/CMakeLists.txt" ] || [ -f "$d/src/program/generate.cpp" ]
 }
 
 find_root() {

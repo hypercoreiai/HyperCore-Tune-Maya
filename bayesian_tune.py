@@ -225,7 +225,7 @@ class Sweeper:
         if self.frozen:
             self.priors = [p for p in priors if _cfg_matches_frozen(p.get("cfg", {}), self.frozen)]
         self.prompt_ids = build_prompt(args.prompt_tokens_file, args.prompt_tokens)
-        self.model = args.model
+        self.model = args.model.lower()
         self._seed_from_history()
 
     def _seed_from_history(self) -> None:

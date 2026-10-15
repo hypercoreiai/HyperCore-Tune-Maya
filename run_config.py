@@ -54,18 +54,6 @@ SWEEP_ONLY: tuple[tuple[str, int], ...] = (
 RUN_CONFIG_MARKERS = ("exe", "args", "cwd")
 
 
-def _setup_module() -> Any | None:
-    """The project's maya.py (or setup.py), or None if it cannot be imported."""
-    root = str(maya_root())
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    for name in ("maya", "setup"):
-        try:
-            return __import__(name)  # the installer module, resolved at call time
-        except Exception as exc:  # noqa: BLE001 - a partial install must not lose a finished sweep
-            print(f"note: {name}.py not importable ({exc}); using built-in defaults", file=sys.stderr)
-    return None
-
 
 def _cuda_lib_dirs() -> list[str]:
     """The CUDA bin/lib directories actually present, the way the run configs list them."""
@@ -130,8 +118,11 @@ def find_base_config(model: str, root: Path) -> dict[str, Any] | None:
     tuning record is never mistaken for a config.
     """
     quant = model.lower()
-    for name in (f"maya-{quant}.json", f"maya-maya-{quant}.json",
-                 f"maya-{quant}.json", f"strata-{quant}.json"):
+    names = [f"maya-{quant}.json"]
+    if not quant.startswith("maya-"):
+        names.append(f"maya-maya-{quant}.json")
+    names.append(f"strata-{quant}.json")
+    for name in names:
         path = root / name
         if not path.is_file():
             continue
@@ -199,20 +190,17 @@ def build_run_config(
                 return os.environ[env]
         return fallback
 
-    setup = _setup_module()
-    if hasattr(setup, "apply_server_defaults"):
-        # The installer's own precedence: what this run asked for, then the model's config,
-        # then the default. A key someone set by hand is never replaced.
-        setup.apply_server_defaults(cfg, base)
-    else:
-        fallback: dict[str, Any] = {
-            "host": default("HOST", "127.0.0.1"),
-            "api_key": default("API_KEY", ""),
-            "port": int(default("PORT", "8080")),
-        }
-        for key, value in fallback.items():
-            if cfg.get(key) is None:
-                cfg[key] = value
+    # No installer hook is available or needed here: keep any value already in the base
+    # config, and only fill the server defaults from environment variables or the usual
+    # localhost fallbacks.
+    fallback: dict[str, Any] = {
+        "host": default("HOST", "127.0.0.1"),
+        "api_key": default("API_KEY", ""),
+        "port": int(default("PORT", "8080")),
+    }
+    for key, value in fallback.items():
+        if cfg.get(key) is None:
+            cfg[key] = value
     cfg["port"] = int(cfg.get("port") or 8080)
     cfg.setdefault("gpu", 0)
 
@@ -236,12 +224,12 @@ def build_run_config(
 
 
 def _write_json(path: Path, cfg: dict[str, Any]) -> Path:
-    """Whole or not at all, the way the installer writes a run config."""
-    setup = _setup_module()
-    write = getattr(setup, "write_config", None)
-    if callable(write):
-        write(path, cfg)
-        return path
+    """Whole or not at all.
+
+    `maya.py`'s installer `write_config` needs the setup arguments (args, pc, meta, pack,
+    quant, ctx, models, vision) that a finished sweep does not have, so the deliverable is
+    written atomically here instead. The JSON shape is the run-config shape the server reads.
+    """
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     os.replace(tmp, path)
