@@ -5,6 +5,7 @@
 #   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --decode   --cntx 131072
 #   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --prefill  --cntx 131072 --trials 60
 #   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --latency  --mode staged --dry-run
+#   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --balance  --cntx 131072
 #   ./HyperCore-Tune-Maya/max_tune.sh --show-project           # print the resolved paths, then exit
 #   ./HyperCore-Tune-Maya/max_tune.sh --install               # put optuna into the project venv, then exit
 #
@@ -14,9 +15,10 @@
 #   --prefill    maximise prompt tokens/s
 #   --latency    minimise prompt_ms + decode_ms
 #   --balance    maximise decode tokens/s discounted by the share of a token the engine spent
-#                on the SSD and the CPU lane (its glm stat line): fast AND resident
+#                off the card (its STAT telemetry line): fast AND resident
 #   --think-budget N   tokens the request may reason before answering (GEN key think_budget)
-#   --think-end N      the pack's think-end token id, 151667 by default
+#   --think-end N      the pack's think-end token, read from its tokenizer (</think> if it
+#                      names one); 151667 for a pack that carries no tokenizer
 #
 #   --cntx N   the context the sweep is tuned at; default 32768 (--context is the alias)
 #
@@ -36,6 +38,12 @@
 #
 # --trials is unseen configurations: a repeat of a point already in history is redrawn
 # and does not count.
+# A configuration measured under another objective is the same fourteen flags, so it is not
+# booted again; it is seeded as seen and re-scored under the objective running.
+# --no-cross-objective restricts reuse to this objective's own history.
+#
+# A boot that never reaches READY within --boot-timeout (300 s) is FAIL_BOOT; a request that
+# never answers within --run-timeout (180 s) is TIMEOUT. Both score as a zero.
 #
 # The sweep checks the free VRAM against the pack's dense pool before the first trial and
 # stops if the card cannot host it (--no-preflight to skip). Three configurations in a row

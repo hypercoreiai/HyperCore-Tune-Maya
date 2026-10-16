@@ -2,13 +2,15 @@
 """HyperCore-Tune-Maya/bayesian_tune.py - Bayesian (TPE) tuning of the Project Maya engine.
 
 Searches the dimensions the GLM engine exposes - vram, pcie, pcie-mode, ple-io, kv,
-kv-streaming, host-worker, pool workers, prompt-cache, draft-floor - against one of four
+kv-streaming, host-worker, pool workers, prompt-cache, draft-floor - against one of five
 user-selected objectives:
 
     --decode    maximise decode tokens/s (the generated-token rate; --gen is its alias)
     --think     maximise thinking tokens/s, the reasoning block alone
     --prefill   maximise prompt tokens/s
     --latency   minimise prompt_ms + decode_ms for the request
+    --balance   maximise decode tokens/s discounted by the share of a token the engine spent
+                off the card: fast AND resident, not just fast
 
 Two search modes:
 
@@ -144,10 +146,12 @@ def signed_score(m: Metrics, objective: str) -> float:
     """One number to maximise. Failed boots score at the bottom of the range.
 
     `balance` is the decode rate discounted by the share of a token the engine spent off the
-    card (SSD reads plus the CPU lane), read from its own `glm stat` line. A configuration
-    that wins on raw tok/s while half its token time is bus waiting scores below one that is
-    a little slower and already resident. With no telemetry the discount is zero, so a stub
-    engine or an older build behaves exactly like --decode.
+    card. That share comes from the engine's own telemetry - the `STAT` counter line a
+    `--serve` engine prints every eight tokens, or the per-request `glm stat` summary on the
+    single-conversation path - attributed with the unit costs the same engine measured at
+    boot. A configuration that wins on raw tok/s while half its token time is bus waiting
+    scores below one that is a little slower and already resident. With no telemetry the
+    discount is zero, so a stub engine or an older build behaves exactly like --decode.
     """
     if not m.ok():
         return PENALTY[objective]
@@ -893,9 +897,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                        help="minimise prompt_ms + decode_ms")
     metric.add_argument("--balance", action="store_const", const="balance", dest="objective",
                        help="maximise decode tokens/s discounted by the share of a token "
-                            "the engine spent on the SSD and the CPU lane (its glm stat "
-                            "line). Finds the configuration that is fast and resident, not "
-                            "just fast.")
+                            "the engine spent off the card (its STAT telemetry line). Finds "
+                            "the configuration that is fast and resident, not just fast.")
     p.add_argument("--objective", choices=OBJECTIVES, default=None,
                    help="same as the metric flag above; the flag wins")
     p.add_argument("--think-budget", type=int, default=0,

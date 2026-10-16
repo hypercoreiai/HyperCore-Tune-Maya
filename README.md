@@ -58,6 +58,7 @@ interpreter on the PATH (`python.exe` / `py -3` on Windows, including
 ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --decode   --cntx 131072
 ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --prefill  --cntx 131072 --trials 60
 ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --think    --think-budget 512 --max-new 1024
+./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --balance  --cntx 131072
 ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --latency  --mode staged --dry-run
 ./HyperCore-Tune-Maya/max_tune.sh --show-project
 ./HyperCore-Tune-Maya/max_tune.sh --help
@@ -86,10 +87,12 @@ One boot, one GEN request, and the engine's own numbers:
 | `thinking_tok_s` | the reasoning block alone: the tokens up to the think-end token, timed from the engine's `T <token>` lines |
 | `answer_tok_s` | the tokens after the reasoning closes, over the rest of `decode_ms` |
 | `latency_ms` | `prompt_ms + decode_ms`, the wall time of the request |
-| `transfer_share` | the part of a token spent on the SSD and the CPU lane, from the engine's `glm stat` line |
+| `transfer_share` | the part of a token spent off the card: the engine's own `vram_hit` counter, or its SSD-read and RAM-fetch counts attributed with the unit costs that same engine measured at boot |
 | `compute_tok_s` | what the same configuration would run at if the bus cost nothing |
 | `disk_reads_per_tok`, `ram_fetches_per_tok`, `promotions_per_tok`, `cpu_experts_per_tok` | the counters on that same line, per token |
 | `disk_bytes_per_s`, `pcie_bytes_per_s` | those counts times the expert blob, read from the pack's `native_experts.txt` |
+| `measured_disk_bytes_per_s`, `measured_pcie_rx_mb_s` | the same traffic measured independently: psutil's block-device counters around the request, and NVML's PCIe throughput sampled every 250 ms during it |
+| `disk_attribution`, `pcie_attribution` | measured divided by derived. Near 1.0 means the attribution holds; far from it means the derived share is a bound, not a measurement |
 
 `--balance` is the objective that answers "fast *and* resident": a configuration at 260 tok/s
 with a third of its token time waiting on the SSD scores below one at 250 tok/s that is
@@ -165,9 +168,11 @@ corner of that trade where the next millisecond of bus traffic stops buying a to
 The reasoning split only exists when the request asks for one. `--think-budget N` puts
 `think_budget=N think_end=<id>` on the GEN line (generate.cpp:1156); without it a
 `--think` sweep has nothing to measure and `--think` is refused at the command line. The
-think-end token is the pack's `<|im_start|>` (151667), which the engine forces when a
-reasoning block reaches its budget or starts repeating itself; pass `--think-end` for a
-pack that uses a different id.
+think-end token is read from the pack's own tokenizer: `</think>` if the pack names one,
+otherwise its end-of-turn token. For Maya-S24 that is **154842** (`<think>` is 154841; both
+are single user-defined entries in that 154,880-token vocabulary, so the split is exact
+rather than a byte-sequence match). A pack carrying no tokenizer falls back to 151667 and
+says so; `--think-end <id>` overrides either.
 
 `--cntx` (also spelled `--context`) defaults to **32768**; pass it explicitly for any other
 context. Run data is keyed by it, so a sweep at 32768 and one at 131072 keep separate
@@ -185,7 +190,9 @@ spending `--trials` boots on the same failure. `--no-preflight` skips the check.
 
 Three configurations in a row that fail the same way stop the sweep too. An unmeasurable
 trial scores the same penalty as a real zero throughput, so a busy GPU looks to the sampler
-like a flat landscape; a repeated failure is the machine, not the search.
+like a flat landscape; a repeated failure is the machine, not the search. A boot that never
+reaches `READY` within `--boot-timeout` (300 s) is recorded `FAIL_BOOT`, and a request that
+never answers within `--run-timeout` (180 s) is recorded `TIMEOUT`; both score as a zero.
 
 ## Search space
 
@@ -350,6 +357,15 @@ fingerprint with `--hardware '<json>'` or `$TUNE_HARDWARE` for containers and te
 `--replay <record.json>` and `--from-records` rewrite the deliverables from measurements
 that already exist, without booting the engine.
 
+### Reusing a point measured under another objective
+
+The fourteen flags that define a configuration are the same under every objective, so a
+`--balance` sweep does not re-boot a point a `--decode` sweep already measured on this
+machine and at this context. Those rows are marked seen, so the sampler never draws them
+again, but they are not carried as priors for scoring: a rate under one objective is not a
+score under another, so each reused point is re-scored with the objective actually running.
+`--no-cross-objective` limits reuse to the current objective's own history.
+
 A prior outside the bounds this run searches (`--vram-max`, `--max-workers`) is skipped and
 counted, never clamped, and it cannot become the best written into `max_<model>_config.json`:
 the launcher a sweep emits only ever carries flags this pack's runner acts on. A `--kv` the
@@ -399,13 +415,23 @@ different one.
 
 ## Tests
 
-The tests never touch a GPU: `stub_engine.py` speaks the real protocol (`INFO`,
-`session is up`, `DONE`) and computes its numbers from the flags it was given.
+The tests never touch a GPU. `stub_engine.py` speaks the real protocol (`INFO`, `READY`,
+`T <token>`, `DONE`, and the `STAT` telemetry line with the boot cost lines), and computes
+its numbers from the flags it was given.
 
 ```bash
 python -m pip install -r HyperCore-Tune-Maya/requirements.txt
-pytest HyperCore-Tune-Maya/test_bayesian_tune.py
+pytest HyperCore-Tune-Maya/test_bayesian_tune.py HyperCore-Tune-Maya/test_transfer.py
 ```
+
+`test_bayesian_tune.py` covers the sweep end to end: argument parsing, the search space
+against the bounds `generate.cpp` enforces, history loading, deliverable writing, the
+reasoning split. `test_transfer.py` covers the telemetry parser and the balance objective
+against recorded engine logs and against synthetic counter lines.
+
+## History
+
+`CHANGELOG.md` records what changed and why, commit by commit.
 
 ## License
 

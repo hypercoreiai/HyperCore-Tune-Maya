@@ -3,5 +3,9 @@
 optuna>=3.6
 psutil>=5.9
 
+# Optional: NVML gives the independent PCIe cross-check in hardware.py. Without it the
+# cross-check fields are None and the derived figures stand alone.
+pynvml>=1.2
+
 # tests
 pytest>=8.0

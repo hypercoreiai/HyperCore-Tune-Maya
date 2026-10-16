@@ -2,7 +2,18 @@
 
 Every trial writes one row with the columns the Project Maya engine actually has:
 
-    layer  vram  pcie  pcie_mode  ple_io  kv  kvstream  hostworker  worker  tail  draft_floor  status
+    layer  vram  pcie  pcie_mode  ple_io  ple_inflight  kv  kvstream  hostworker  worker
+           tail  draft_floor  suffix_draft  mtp_max_t  parallel  status
+
+plus the transfer columns transfer.py appends to every row:
+
+    decode_ms_per_tok  off_card_ms_per_tok  transfer_share  off_card_lookup_share
+    compute_tok_s  headroom  disk_ms_per_read  disk_saturation  measured_times
+    disk_bytes_per_s  measured_disk_bytes_per_s  disk_attribution  pcie_bytes_per_s
+    measured_pcie_rx_mb_s  measured_pcie_tx_mb_s  pcie_attribution  disk_reads_per_tok
+    disk_ms_per_tok  ram_fetches_per_tok  promotions_per_tok  cpu_experts_per_tok
+    cpu_ms_per_tok  vram_hit_pct  kv_hit_pct  kv_mib_from_ram  spec_accepted
+    spec_steps  flags
 
 `layer` is the group a trial is perturbing. In staged mode it is the layer the study is
 currently frozen on; in joint mode it is the group whose value differs from the incumbent

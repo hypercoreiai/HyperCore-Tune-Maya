@@ -13,12 +13,22 @@ lines it prints:
 A finished request also prints, on stderr - which this module reads because the process is
 started with stderr merged into stdout:
 
+    STAT tok_s= ms_tok= vram_hit= ram_fetch= disk= promo= vram_used=/slots ram_used=/slots
+         the live tier counters, every 8 tokens (generate.cpp:1820, 2122). This is the only
+         telemetry a --serve engine with STRATA_GLM_SEQS > 1 emits, and it is the same line
+         the Monitor in project-maya/serve/server.py reads.
     glm stat: decode ... ms/tok | vram hit ...% | ram fetches .../tok | disk ... reads/tok ...
+         the per-request summary, printed only on the single-conversation path (1925)
     glm kv: / glm spec: / glm skip:                                         generate.cpp:1928-1951
+    glm fast: CUDA0 CPU lane: an expert 0.136 ms on the CPU vs 0.453 ms over PCIe ...
+    glm fast: CUDA0 tiers warm: 4614 experts (32.8 GB) in 18 s (1.87 GB/s)
+         the machine's own unit costs, measured at boot: how long one expert takes on the
+         host, over PCIe, and off the SSD.
 
 Those are the transfer figures. transfer.py parses them and turns them into the resource side
 of a trial: how much of a token is off-card time, and what the configuration would run at if
-the bus cost nothing.
+the bus cost nothing. Counts are attributed with those boot costs; where the engine gave the
+milliseconds directly, its numbers are used and the provenance is recorded.
 
 READY is the go signal: the engine only reads GEN lines after it. An engine from before
 the M3.1 GLM path said "session is up" in its place; both are accepted, and nothing is
