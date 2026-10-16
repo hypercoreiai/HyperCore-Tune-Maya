@@ -19,6 +19,13 @@ engine binary and the prompt length that produced its numbers, and a prior from 
 engine or a different prompt is dropped rather than merged: two tok/s figures are only
 comparable when the same binary read the same prompt.
 
+Priors are keyed by objective, but a configuration is the same fourteen flags under every
+objective. `other_objective_history()` therefore returns the rows for this machine, model and
+context that were measured under a *different* objective: they are marked seen so the sampler
+never boots them twice, and they are re-scored with the objective actually running rather than
+reused as scores. They stay `from_history=True`, so they cannot win. `--no-cross-objective`
+restricts reuse to the current objective's own file.
+
 draft_floor is part of the configuration signature. Older records that stored it only as
 the run-level spec_min_p still load: the missing key is filled from that field.
 
