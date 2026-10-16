@@ -93,7 +93,8 @@ TRANSFER_WEIGHT = 0.35
 TRANSFER_COLUMNS: tuple[str, ...] = (
     "decode_ms_per_tok", "off_card_ms_per_tok", "transfer_share", "off_card_lookup_share",
     "compute_tok_s", "headroom", "disk_ms_per_read", "disk_saturation", "measured_times",
-    "disk_bytes_per_s", "measured_disk_bytes_per_s", "disk_attribution", "pcie_bytes_per_s", "disk_reads_per_tok", "disk_ms_per_tok",
+    "disk_bytes_per_s", "measured_disk_bytes_per_s", "disk_attribution", "pcie_bytes_per_s",
+    "measured_pcie_rx_mb_s", "measured_pcie_tx_mb_s", "pcie_attribution", "disk_reads_per_tok", "disk_ms_per_tok",
     "ram_fetches_per_tok", "promotions_per_tok", "cpu_experts_per_tok", "cpu_ms_per_tok",
     "vram_hit_pct", "kv_hit_pct", "kv_mib_from_ram", "spec_accepted", "spec_steps", "flags",
 )
@@ -251,6 +252,9 @@ class Transfer:
     # Bytes the host's block devices actually served during the request, per second.
     # None when psutil is unavailable or nothing measurable crossed the drive.
     measured_disk_bytes_per_s: float | None = None
+    # NVML's PCIe throughput during the request, in MB/s. None when NVML is unavailable.
+    measured_pcie_rx_mb_s: float | None = None
+    measured_pcie_tx_mb_s: float | None = None
     # The engine's own unit costs, from its boot lines. None when it printed none.
     cpu_ms_per_expert: float | None = None
     pcie_ms_per_expert: float | None = None
@@ -263,7 +267,9 @@ class Transfer:
 
     @classmethod
     def from_lines(cls, lines: Iterable[str], blob_bytes: float | None = None,
-                   measured_disk_bytes_per_s: float | None = None) -> Transfer:
+                   measured_disk_bytes_per_s: float | None = None,
+                   measured_pcie_rx_mb_s: float | None = None,
+                   measured_pcie_tx_mb_s: float | None = None) -> Transfer:
         """Fold every telemetry line in an engine log into one record.
 
         The per-request summary (`glm stat`) wins where it exists: it is the engine's own
@@ -299,9 +305,13 @@ class Transfer:
                 warm = parse_warm_line(line) or warm
         if not stats and not live and not kv and not spec and not skip:
             return Transfer(blob_bytes=blob_bytes,
-                           measured_disk_bytes_per_s=measured_disk_bytes_per_s)
+                           measured_disk_bytes_per_s=measured_disk_bytes_per_s,
+                           measured_pcie_rx_mb_s=measured_pcie_rx_mb_s,
+                           measured_pcie_tx_mb_s=measured_pcie_tx_mb_s)
         out = Transfer(blob_bytes=blob_bytes, stat_lines=len(stats), live_lines=len(live),
-                       measured_disk_bytes_per_s=measured_disk_bytes_per_s)
+                       measured_disk_bytes_per_s=measured_disk_bytes_per_s,
+                       measured_pcie_rx_mb_s=measured_pcie_rx_mb_s,
+                       measured_pcie_tx_mb_s=measured_pcie_tx_mb_s)
         out.cpu_ms_per_expert = costs.get("cpu_ms_per_expert")
         out.pcie_ms_per_expert = costs.get("pcie_ms_per_expert")
         out.ram_ms_per_expert = costs.get("ram_ms_per_expert")
@@ -509,6 +519,19 @@ class Transfer:
             return None
         return float(self.measured_disk_bytes_per_s) / float(derived)
 
+    @property
+    def pcie_attribution(self) -> float | None:
+        """Link traffic NVML saw, divided by the link traffic the counters imply.
+
+        None when either side is missing. NVML's rx counter is the GPU receiving experts,
+        which is what the RAM-tier fetch count describes, so the two are directly
+        comparable - up to the engine's pipelining and whatever else the link carries.
+        """
+        derived = self.pcie_bytes_per_s
+        if not self.measured_pcie_rx_mb_s or not derived:
+            return None
+        return (float(self.measured_pcie_rx_mb_s) * 1e6) / float(derived)
+
     def summary(self) -> str:
         """One line: what the bus is doing for this configuration, and how it was worked out.
 
@@ -535,6 +558,12 @@ class Transfer:
         if attribution is not None:
             parts.append(f"host counters read {self.measured_disk_bytes_per_s / 1e6:.0f} MB/s "
                         f"({attribution:.2f}x the derived traffic)")
+        if self.measured_pcie_rx_mb_s:
+            link = f"NVML saw {self.measured_pcie_rx_mb_s:.0f} MB/s in over the link"
+            pcie_ratio = self.pcie_attribution
+            if pcie_ratio is not None:
+                link += f" ({pcie_ratio:.2f}x the derived traffic)"
+            parts.append(link)
         ceiling = self.compute_tok_s
         headroom = ""
         if ceiling > 0 and self.decode_ms_per_tok > 0 and ceiling > 1000.0 / self.decode_ms_per_tok:
@@ -561,6 +590,12 @@ class Transfer:
                                          if self.measured_disk_bytes_per_s else None),
             "disk_attribution": (round(self.disk_attribution, 3)
                                  if self.disk_attribution is not None else None),
+            "measured_pcie_rx_mb_s": (round(self.measured_pcie_rx_mb_s, 1)
+                                      if self.measured_pcie_rx_mb_s else None),
+            "measured_pcie_tx_mb_s": (round(self.measured_pcie_tx_mb_s, 1)
+                                      if self.measured_pcie_tx_mb_s else None),
+            "pcie_attribution": (round(self.pcie_attribution, 3)
+                                 if self.pcie_attribution is not None else None),
             "pcie_bytes_per_s": (round(self.pcie_bytes_per_s, 1)
                                  if self.pcie_bytes_per_s is not None else None),
             "disk_reads_per_tok": round(self.disk_reads_per_tok, 2),

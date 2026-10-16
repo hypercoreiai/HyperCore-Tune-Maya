@@ -284,6 +284,28 @@ def _apply_tier(block: dict[str, Any], tier_mib: int | None) -> dict[str, Any]:
     return block
 
 
+def pcie_throughput_kb_s(device: int = 0) -> dict[str, float] | None:
+    """Instantaneous PCIe rx/tx in KB/s from NVML, or None when NVML is unavailable.
+
+    NVML reports a rolling window, so one reading is only meaningful while the engine is
+    actually moving experts. engine_runner polls it for the duration of a request and takes
+    the mean and the peak, which is what makes it comparable with the engine's own
+    per-token figures. Same call project-maya's Monitor uses (serve/telemetry.py:167).
+    """
+    try:
+        import pynvml  # type: ignore
+    except ImportError:
+        return None
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+        rx = pynvml.nvmlDeviceGetPcieThroughput(handle, 1)   # NVML_PCIE_UTIL_RX_BYTES
+        tx = pynvml.nvmlDeviceGetPcieThroughput(handle, 0)   # NVML_PCIE_UTIL_TX_BYTES
+    except (OSError, AttributeError, TypeError, pynvml.NVMLError):
+        return None
+    return {"rx_kb_s": float(rx), "tx_kb_s": float(tx)}
+
+
 def ambient_state(tier_mib: int | None = None) -> dict[str, Any]:
     """Free VRAM, GPU processes, and host memory at the instant a trial runs.
 

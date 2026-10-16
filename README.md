@@ -130,18 +130,23 @@ deliver: 0.6 means the decode is asking for 60% of what the SSD can do.
 If a build does print `glm stat:` (single-conversation runs), its `ms/tok` figures are used as
 measured and `measured_times` is set in the record, so the provenance of every number is visible.
 
-### The independent cross-check
+### The independent cross-checks
 
-The engine's counters are the only view of what it moved, so the tuner also samples the host's
-block-device counters with psutil before and after every request (`hardware.disk_io_snapshot`).
-`measured_disk_bytes_per_s` is what the drive actually served during that request, and
-`disk_attribution` is that divided by the derived figure. A ratio near 1.0 means the attribution
-is sound; far from 1.0 means the derived share is a bound, not a measurement - reads are
-pipelined, or the host is doing other I/O.
+The engine's counters are the only view of what it moved, so the tuner measures two things
+independently:
 
-PCIe traffic cannot be cross-checked here: NVML is not installed in the tuning venv
-(`import nvml` fails), so `pcie_bytes_per_s` stays a derived figure. Installing `nvidia-ml-py`
-would let the same pattern apply to the link.
+- **The drive.** `hardware.disk_io_snapshot()` samples psutil's block-device counters before
+  and after every request. `measured_disk_bytes_per_s` is what the drive actually served, and
+  `disk_attribution` is that divided by the derived figure. Near 1.0 means the attribution is
+  sound; far from it means the derived share is a bound, not a measurement - reads are
+  pipelined, or the host is doing other I/O.
+- **The link.** `hardware.pcie_throughput_kb_s()` reads NVML's `nvmlDeviceGetPcieThroughput`
+  (the same call project-maya's Monitor uses, `serve/telemetry.py:167`), and `PcieSampler`
+  polls it every 250 ms for the duration of a request. `measured_pcie_rx_mb_s` is the mean
+  the GPU received; `pcie_attribution` compares it with the RAM-tier fetch count times the
+  blob size. On a host without NVML both are `None` and the derived figures stand alone.
+
+Verified live on this machine: `pcie_throughput_kb_s()` returns `{'rx_kb_s': 341.0, 'tx_kb_s': 439.0}` at idle.
 
 Re-running the parser over the logs from a real sweep on this machine:
 

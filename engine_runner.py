@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from hardware import disk_io_snapshot
+from hardware import disk_io_snapshot, pcie_throughput_kb_s
 from transfer import Transfer
 
 DONE_MIN_FIELDS = 6
@@ -103,6 +103,7 @@ class Metrics:
     answer_tokens: int = 0
     thinking: bool = False        # the request carried a thinking budget
     measured_disk_read_bytes: float = 0.0   # host block reads during the request, from psutil
+    measured_pcie_mb_s: dict[str, float] = field(default_factory=dict)  # NVML rx/tx, if present
     prompt_tokens: int = 0
     prompt_read: int = 0
     generated: int = 0
@@ -154,6 +155,57 @@ def parse_done(line: str, rid: int | None = None) -> dict[str, Any]:
     if rid is not None:
         out["rid"] = rid
     return out
+
+
+class PcieSampler:
+    """Polls NVML's PCIe throughput for the duration of a request.
+
+    NVML's counter is a rolling window, so the useful numbers are the mean over the request
+    and the peak inside it: the mean is comparable with the engine's per-token traffic, the
+    peak shows whether the link ever reached its limit. On a host without NVML the sampler
+    records nothing and the derived figures stand on their own.
+    """
+
+    def __init__(self, interval: float = 0.25) -> None:
+        self.interval = interval
+        self.samples: list[dict[str, float]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> bool:
+        if pcie_throughput_kb_s() is None:
+            return False
+        self._stop.clear()
+        self.samples = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def _run(self) -> None:
+        # Read first, then wait: a request that finishes inside one interval still gets a
+        # reading, so start() and stop() never disagree about whether NVML is present.
+        while True:
+            sample = pcie_throughput_kb_s()
+            if sample is not None:
+                self.samples.append(sample)
+            if self._stop.wait(self.interval):
+                break
+
+    def stop(self) -> dict[str, float]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        if not self.samples:
+            return {}
+        rx = [s["rx_kb_s"] for s in self.samples]
+        tx = [s["tx_kb_s"] for s in self.samples]
+        return {
+            "rx_mean_mb_s": sum(rx) / len(rx) / 1024.0,
+            "rx_peak_mb_s": max(rx) / 1024.0,
+            "tx_mean_mb_s": sum(tx) / len(tx) / 1024.0,
+            "tx_peak_mb_s": max(tx) / 1024.0,
+            "samples": len(self.samples),
+        }
 
 
 def reasoning_split(times: Sequence[tuple[float, int]], generated: int, decode_ms: float,
@@ -528,7 +580,11 @@ class EngineSession:
         self.pending = b""
         self.token_times: list[tuple[float, int]] = []   # this request's T lines, in order
         self.think_end: int | None = None                # the think-end id this request asked for
-        self.chunks: queue.Queue[bytes | None] = queue.Queue()
+        # Each item is (bytes, monotonic-clock reading of the moment those bytes came off
+        # the pipe). The stamp has to be taken by the reader, not by whoever later parses
+        # the line: a busy main thread drains several chunks at once and would otherwise
+        # give every token in the burst the same time, flattening the reasoning split.
+        self.chunks: queue.Queue[tuple[bytes, float] | None] = queue.Queue()
         self.ready = False
         self.multi = 0          # the READY line's multi=<n>: conversations at once
         self.rid = 0            # the id the next GEN request will carry
@@ -581,7 +637,7 @@ class EngineSession:
                     chunk = os.read(fd, 65536)
                     if not chunk:
                         break
-                    self.chunks.put(chunk)
+                    self.chunks.put((chunk, time.monotonic()))
             except OSError:
                 pass
             finally:
@@ -600,17 +656,19 @@ class EngineSession:
         except (BrokenPipeError, OSError, ValueError):
             return False
 
-    def _note_line(self, text: str) -> None:
+    def _note_line(self, text: str, when: float | None = None) -> None:
         """Record one engine line and keep whatever state it changes.
 
         The READY line is where the several-conversation mode is announced, and that is
-        what decides whether a GEN line has to carry a rid.
+        what decides whether a GEN line has to carry a rid. `when` is the clock reading
+        the reader took when the line came off the pipe; without it a token's time would
+        be the time the parser got to it.
         """
         self.lines.append(text)
         if text.startswith("T "):
             tok = parse_token_line(text, self.rid if self.multi else None)
             if tok is not None:
-                self.token_times.append((time.monotonic(), tok))
+                self.token_times.append((when if when is not None else time.monotonic(), tok))
         elif text.startswith("INFO "):
             self.info.update(parse_info(text))
         elif is_ready(text):
@@ -626,31 +684,33 @@ class EngineSession:
         """Read until the engine says READY, so the request knows the mode it is in."""
         while time.monotonic() < deadline and not self.ready and not self.eof:
             try:
-                chunk = self.chunks.get(timeout=0.5)
+                item = self.chunks.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if chunk is None:
+            if item is None:
                 self.eof = True
                 break
+            chunk, when = item
             self.pending += chunk
             while b"\n" in self.pending:
                 raw_line, self.pending = self.pending.split(b"\n", 1)
-                self._note_line(raw_line.decode("utf-8", "replace"))
+                self._note_line(raw_line.decode("utf-8", "replace"), when)
 
     def _consume_until_done(self, deadline: float, rid: int | None = None) -> dict[str, Any] | None:
         while time.monotonic() < deadline and not self.eof:
             try:
-                chunk = self.chunks.get(timeout=0.5)
+                item = self.chunks.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if chunk is None:
+            if item is None:
                 self.eof = True
                 break
+            chunk, when = item
             self.pending += chunk
             while b"\n" in self.pending:
                 raw_line, self.pending = self.pending.split(b"\n", 1)
                 text = raw_line.decode("utf-8", "replace")
-                self._note_line(text)
+                self._note_line(text, when)
                 if text.startswith("ERR "):
                     return {"__err__": text}
                 if text.startswith("DONE "):
@@ -665,11 +725,9 @@ class EngineSession:
     ) -> Metrics:
         """Send one GEN request to the already-running engine.
 
-        The host's block-device counters are sampled before and after the request so the
-        bytes the drive really served can be set against the figure the engine's own
-        read counts imply. That is the only part of the transfer picture that can be
-        measured independently of the engine; PCIe traffic needs NVML, which this
-        environment does not have.
+        The host's block-device counters are sampled before and after the request and NVML's
+        PCIe throughput is polled while it runs, so the bytes the drive and the link really
+        served can be set against the figures the engine's own read counts imply.
         """
         metrics = Metrics(log_path=str(self.log_path), effective=dict(self.effective or self.info))
         t_start = time.monotonic()
@@ -719,6 +777,11 @@ class EngineSession:
             metrics.note = "the engine closed its stdin"
             return metrics
 
+        # Sample the link while the request runs: NVML's PCIe counter is the only view of
+        # the traffic that is not the engine's own accounting.
+        sampler = PcieSampler()
+        sampler.start()
+
         deadline = time.monotonic() + (self.boot_timeout if not self.ready else self.run_timeout)
         try:
             done = self._consume_until_done(deadline, rid)
@@ -727,6 +790,7 @@ class EngineSession:
             done = None
 
         metrics.wall_ms = (time.monotonic() - t_start) * 1000.0
+        metrics.measured_pcie_mb_s = sampler.stop()
         disk_after = disk_io_snapshot()
         metrics.measured_disk_read_bytes = max(
             0.0, disk_after["read_bytes"] - disk_before["read_bytes"]
@@ -790,6 +854,8 @@ class EngineSession:
         metrics.transfer = Transfer.from_lines(
             self.lines, blob_bytes=self.blob_bytes,
             measured_disk_bytes_per_s=measured_disk_s,
+            measured_pcie_rx_mb_s=metrics.measured_pcie_mb_s.get("rx_mean_mb_s"),
+            measured_pcie_tx_mb_s=metrics.measured_pcie_mb_s.get("tx_mean_mb_s"),
         ).as_dict()
         return metrics
 

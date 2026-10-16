@@ -167,6 +167,30 @@ def test_the_snapshot_never_raises_without_psutil_or_a_drive() -> None:
     assert all(value >= 0.0 for value in snapshot.values())
 
 
+def test_the_link_cross_check_is_reported_when_nvml_reports() -> None:
+    """NVML's rx counter is the GPU receiving experts, which is what the RAM-tier fetch
+    count describes, so the two can be divided. Without NVML the field is None, never 0."""
+    parsed = Transfer.from_lines([LANE, WARM, STAT_LIVE], blob_bytes=7012352.0,
+                                 measured_pcie_rx_mb_s=1000.0)
+    derived = parsed.pcie_bytes_per_s
+    assert derived and abs(parsed.pcie_attribution - 1e9 / derived) < 1e-6
+    assert "NVML saw 1000 MB/s" in parsed.summary()
+    assert "measured_pcie_rx_mb_s" in TRANSFER_COLUMNS
+    assert Transfer.from_lines([STAT_LIVE]).pcie_attribution is None
+
+
+def test_the_sampler_is_safe_when_nvml_is_absent() -> None:
+    """start() and stop() agree: a host without NVML samples nothing and the derived
+    figures stand alone. Nothing raises either way."""
+    from engine_runner import PcieSampler
+    sampler = PcieSampler(interval=0.05)
+    started = sampler.start()
+    result = sampler.stop()
+    assert started == bool(result)
+    if result:
+        assert result["samples"] >= 1 and result["rx_mean_mb_s"] >= 0.0
+
+
 def test_knee_stops_where_more_resource_stops_paying() -> None:    # 10 -> 13 -> 13.2 -> 11: the gain at index 2 is under 3%, and the drop at 3 is below 70%.
     assert knee([(0.0, 10.0), (0.25, 13.0), (0.5, 13.2), (0.75, 11.0)]) == 2
     assert knee([(0.0, 10.0), (0.25, 13.0), (0.5, 17.0)]) is None
