@@ -1361,6 +1361,82 @@ def test_a_second_sweep_does_not_reboot_known_points_and_keeps_drawing():
     assert (out / "max_maya-s24_run.sh").exists() and (out / "max_maya-s24_config.json").exists()
 
 
+def test_a_point_measured_under_another_objective_is_not_booted_again():
+    """A configuration is the same fourteen flags whatever score was put on it.
+
+    History is keyed by objective, so a --balance sweep after a --decode sweep would boot
+    the identical configurations a second time to measure the same thing. The other
+    objective's configurations are carried into `seen`; they are not priors, because a
+    decode score is not a balance score.
+    """
+    out = Path("/tmp/hc-optuna-cross-objective")
+    base = ["--hardware", PINNED, "--sampler", "random", "--trials", "6", "--seed", "3"]
+    _run(base + ["--decode"], out)
+    decode_cfgs = {tuple(sorted(r["cfg"].items())) for r in _record(out)["trials"]}
+    assert len(decode_cfgs) == 6
+
+    code, _ = _run(base + ["--balance"], out, fresh=False)
+    assert code == 0
+    record = _record(out)
+    assert record["history"]["foreign_seen"] == 6, "the decode points must be known to the study"
+    assert record["study"]["measured"] == 6, "--trials still means six new boots"
+    balance_cfgs = {tuple(sorted(r["cfg"].items())) for r in record["trials"]}
+    assert not decode_cfgs & balance_cfgs, "the balance sweep re-measured decode's points"
+    assert len({p for p in (out / "results").glob("run-*.log")}) == 12
+    assert record["history"]["trials_loaded"] == 0, "balance has no priors of its own yet"
+
+    # Turning the carry-over off puts the duplicates back: a cold objective with no history
+    # of its own re-boots the points another objective already measured.
+    code, _ = _run(base + ["--latency", "--no-cross-objective"], out, fresh=False)
+    assert code == 0
+    record = _record(out)
+    assert record["history"]["foreign_seen"] == 0
+    again = {tuple(sorted(r["cfg"].items())) for r in record["trials"]}
+    assert again & decode_cfgs, "--no-cross-objective must allow a re-measure"
+
+
+def test_a_foreign_prior_is_scored_for_the_objective_being_run():
+    """The number a prior carries belongs to the objective that produced it."""
+    from bayesian_tune import prior_score
+    from engine_runner import Metrics
+
+    m = Metrics(status="PASS", decode_tok_s=8.0, prefill_tok_s=300.0, latency_ms=1000.0)
+    m.transfer = {"transfer_share": 0.5}
+    assert prior_score(m, "decode") == 8.0
+    assert prior_score(m, "balance") == 8.0 * (1 - 0.35 * 0.5)
+    assert prior_score(m, "prefill") == 300.0
+    assert prior_score(m, "latency") == -1000.0
+    # No telemetry, no discount: a pre-transfer record behaves like --decode.
+    bare = Metrics(status="PASS", decode_tok_s=8.0)
+    assert prior_score(bare, "balance") == 8.0
+
+
+def test_other_objective_history_skips_the_current_objective_and_other_machines():
+    from hardware import hardware_from
+    from history import history_path, other_objective_history
+
+    out = Path("/tmp/hc-optuna-history-filter")
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "history").mkdir(parents=True)
+    hw = hardware_from(json.loads(PINNED))
+    for objective in ("decode", "balance", "latency"):
+        history_path(out / "history", "maya-s24", objective, int(TEST_CNTX), hw).write_text(
+            json.dumps({
+                "schema": "hypercore.tuning_history/1", "model": "maya-s24",
+                "objective": objective, "context": int(TEST_CNTX),
+                "hardware": hw.to_dict(), "hardware_slug": PINNED_SLUG,
+                "runs": [], "trials": [],
+            }), encoding="utf-8")
+    found = [p.name for p in other_objective_history(out / "history", "maya-s24",
+                                                     int(TEST_CNTX), hw, "decode")]
+    assert len(found) == 2 and not any("decode" in n for n in found)
+    assert other_objective_history(out / "history", "maya-s24", 8192, hw, "decode") == []
+    other = [p for p in other_objective_history(out / "history", "maya-s24", int(TEST_CNTX),
+                                               hardware_from(json.loads(OTHER)), "decode",
+                                               allow_mismatch=True)]
+    assert len(other) == 2, "--allow-hardware-mismatch carries the other machine too"
+
+
 def test_run_data_from_another_machine_is_not_used():
     out = Path("/tmp/hc-optuna-mismatch")
     _run(["--hardware", PINNED, "--trials", "3", "--seed", "4"], out)
@@ -1757,6 +1833,55 @@ def test_ambient_state_is_recorded_for_every_trial(monkeypatch):
     record = _record(out)
     assert all(t["ambient"]["free_vram_mib"] == 12345 for t in record["trials"])
     assert all(t["ambient"]["gpu_processes"] for t in record["trials"])
+
+
+def test_ambient_state_reports_whether_the_tier_can_stay_resident():
+    """The `vram` tier of a trial is compared against the host RAM that is actually free.
+
+    A pinned tier larger than the available RAM means the expert pool is being paged, so
+    the measured rate is set by memory pressure rather than by the swept knobs. The
+    arithmetic is checked against a pinned ambient block so the test needs no psutil.
+    """
+    from hardware import ambient_state
+
+    monkeypatch_env = dict(os.environ)
+    os.environ["TUNE_AMBIENT_JSON"] = json.dumps({
+        "free_vram_mib": 12345,
+        "gpu_processes": [],
+        "free_ram_mb": 9000.0,
+        "total_ram_mb": 31000.0,
+        "swap_used_mb": 4200.0,
+    })
+    try:
+        amb = ambient_state(1024)
+        assert amb["tier_mib"] == 1024
+        assert amb["tier_headroom_mb"] == 7976.0
+        assert amb["tier_resident"] is True
+
+        over = ambient_state(12000)
+        assert over["tier_resident"] is False
+        assert over["tier_headroom_mb"] == -3000.0
+
+        # No tier asked for: nothing is claimed about residency.
+        assert "tier_mib" not in ambient_state()
+    finally:
+        os.environ.update(monkeypatch_env)
+
+
+def test_sweep_records_the_trial_tier_in_the_ambient_block(monkeypatch):
+    out = Path("/tmp/hc-ambient-tier-test")
+    monkeypatch.delenv("TUNE_AMBIENT_JSON", raising=False)
+    code, out = _run(["--gen", "--trials", "2", "--seed", "7",
+                      "--vram-min", "512", "--vram-max", "1024", "--vram-step", "512"], out)
+    assert code == 0
+    record = _record(out)
+    assert record["trials"], "no trials measured"
+    for trial in record["trials"]:
+        amb = trial["ambient"]
+        assert amb["tier_mib"] == trial["cfg"]["vram"]
+        if "free_ram_mb" in amb:
+            assert amb["tier_headroom_mb"] == round(amb["free_ram_mb"] - amb["tier_mib"], 1)
+            assert amb["tier_resident"] == (amb["free_ram_mb"] >= amb["tier_mib"])
 
 
 def test_two_stage_sweep_records_request_dimensions_in_the_trial():

@@ -130,6 +130,19 @@ deliver: 0.6 means the decode is asking for 60% of what the SSD can do.
 If a build does print `glm stat:` (single-conversation runs), its `ms/tok` figures are used as
 measured and `measured_times` is set in the record, so the provenance of every number is visible.
 
+### The independent cross-check
+
+The engine's counters are the only view of what it moved, so the tuner also samples the host's
+block-device counters with psutil before and after every request (`hardware.disk_io_snapshot`).
+`measured_disk_bytes_per_s` is what the drive actually served during that request, and
+`disk_attribution` is that divided by the derived figure. A ratio near 1.0 means the attribution
+is sound; far from 1.0 means the derived share is a bound, not a measurement - reads are
+pipelined, or the host is doing other I/O.
+
+PCIe traffic cannot be cross-checked here: NVML is not installed in the tuning venv
+(`import nvml` fails), so `pcie_bytes_per_s` stays a derived figure. Installing `nvidia-ml-py`
+would let the same pattern apply to the link.
+
 Re-running the parser over the logs from a real sweep on this machine:
 
 ```text

@@ -20,6 +20,8 @@ rem Freeze any of them with the matching flag (--pcie, --kv, --draft-floor, --pa
 rem --kv is limited to what the pack runner implements (int8/fp16 for --glm-pack);
 rem --parallel is a GLM-pack dimension, suffix-draft/mtp-max-t only when no --dflash was found.
 rem --trials counts unseen configurations; repeats in history are redrawn.
+rem A configuration measured under another objective is the same fourteen flags, so it
+rem is not booted a second time; --no-cross-objective allows the re-measure.
 rem The sweep checks free VRAM against the pack dense pool before the first trial and stops
 rem if the card cannot host it. --no-preflight skips that check.
 rem --cntx sets the context the sweep is tuned at; default 32768.

@@ -6,12 +6,14 @@ end-to-end case boots stub_engine.py, which prints the same telemetry the real e
 from __future__ import annotations
 
 import csv
+import json
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+from engine_runner import think_end_token
 from transfer import (
     TRANSFER_COLUMNS,
     Transfer,
@@ -143,6 +145,28 @@ def test_a_real_engine_log_yields_a_real_number() -> None:
     assert parsed.disk_reads_per_tok > 0
 
 
+def test_the_host_counter_cross_check_is_reported() -> None:
+    """psutil is the only measurement of drive traffic independent of the engine's own
+    counters. The ratio against the derived figure tells a reader whether the attribution
+    can be trusted, so it is recorded and never silently zeroed."""
+    parsed = Transfer.from_lines([LANE, WARM, STAT_LIVE], blob_bytes=7012352.0,
+                                 measured_disk_bytes_per_s=1_500_000.0)
+    derived = parsed.disk_bytes_per_s
+    assert derived and derived > 0
+    assert abs(parsed.disk_attribution - 1_500_000.0 / derived) < 1e-6
+    assert "host counters" in parsed.summary()
+    assert "measured_disk_bytes_per_s" in TRANSFER_COLUMNS
+    # No host counter: the ratio is absent, not zero.
+    assert Transfer.from_lines([STAT_LIVE], blob_bytes=7012352.0).disk_attribution is None
+
+
+def test_the_snapshot_never_raises_without_psutil_or_a_drive() -> None:
+    from hardware import disk_io_snapshot
+    snapshot = disk_io_snapshot()
+    assert set(snapshot) == {"read_bytes", "write_bytes"}
+    assert all(value >= 0.0 for value in snapshot.values())
+
+
 def test_knee_stops_where_more_resource_stops_paying() -> None:    # 10 -> 13 -> 13.2 -> 11: the gain at index 2 is under 3%, and the drop at 3 is below 70%.
     assert knee([(0.0, 10.0), (0.25, 13.0), (0.5, 13.2), (0.75, 11.0)]) == 2
     assert knee([(0.0, 10.0), (0.25, 13.0), (0.5, 17.0)]) is None
@@ -197,3 +221,57 @@ def test_blob_bytes_come_from_the_real_pack() -> None:
     if pack.is_dir():
         blob = expert_blob_bytes(pack)
         assert blob and blob > 1_000_000, "an expert blob is megabytes, not bytes"
+
+
+def test_think_end_is_read_from_the_pack_that_has_one() -> None:
+    """The id that closes reasoning is per-pack. Guessing one is what makes a sweep report
+    thinking 0.0 tok/s: the engine accepts any id, so the split never fires."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "vocab.json").write_text(json.dumps({"hello": 1, "</think>": 4211}),
+                                         encoding="utf-8")
+        assert think_end_token(str(root)) == 4211
+        # No </think>: fall through to the pack's end-of-turn token.
+        (root / "vocab.json").write_text(json.dumps({"<|im_end|>": 7}), encoding="utf-8")
+        assert think_end_token(str(root)) == 7
+        # Nothing at all: None, so the caller uses the documented default and says so.
+        (root / "vocab.json").write_text(json.dumps({"hello": 1}), encoding="utf-8")
+        assert think_end_token(str(root)) is None
+        assert think_end_token(None) is None
+        assert think_end_token("/definitely/not/a/tokenizer") is None
+    pack = Path("/home/ai-user0/Maya-data/models/Maya-S24/pack/tokenizer")
+    if pack.is_dir():
+        # Verified against pack/tokenizer/vocab.json: </think> is 154842.
+        assert think_end_token(str(pack)) == 154842
+
+
+def test_a_sweep_sends_the_pack_think_end_not_a_guess() -> None:
+    """With --think-budget the GEN line must carry the pack's own close-of-think id."""
+    pack = Path("/home/ai-user0/Maya-data/models/Maya-S24/pack")
+    if not pack.is_dir():
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [sys.executable, str(Path(__file__).resolve().parent / "bayesian_tune.py"),
+               "--engine", "stub_engine.py", "--balance", "--trials", "1", "--seed", "3",
+               "--model", "maya-s24", "--pack", str(pack), "--results-dir", tmp,
+               "--deliverable-dir", tmp, "--max-new", "256", "--cntx", "8192",
+               "--prompt-tokens", "1024", "--think-budget", "64"]
+        env = {key: value for key, value in os.environ.items() if key != "MAYA_ROOT"}
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                            check=False, env=env)
+        assert out.returncode == 0, out.stderr[-400:]
+        assert "think-end: this pack closes reasoning with token 154842" in out.stdout
+        records = list(Path(tmp).glob("*.json"))
+        assert records, "the sweep wrote no record"
+        conditions = None
+        for path in records:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and "conditions" in data:
+                conditions = data["conditions"]
+                break
+        assert conditions is not None, "no record carried a conditions block"
+        assert conditions["think_budget"] == 64
+        assert conditions["think_end"] == 154842, conditions

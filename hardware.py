@@ -221,8 +221,76 @@ def gpu_processes() -> list[dict[str, Any]]:
     return procs
 
 
-def ambient_state() -> dict[str, Any]:
-    """Free VRAM and GPU processes at the instant a trial is about to run.
+def memory_state() -> dict[str, float]:
+    """Free RAM, swap in use, and cumulative block-device reads at this instant.
+
+    The engine pins a host-RAM tier for the expert pool. When the pack is larger than
+    the host, that tier cannot stay resident and every measured prefill is set by page
+    fault traffic rather than by the swept knobs, so the sweep records the pressure
+    alongside the score. psutil is optional: a host without it gets an empty dict.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return {}
+    try:
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        disk = psutil.disk_io_counters()
+    except (RuntimeError, OSError):
+        return {}
+    return {
+        "free_ram_mb": round(mem.available / 1_000_000.0, 1),
+        "total_ram_mb": round(mem.total / 1_000_000.0, 1),
+        "swap_used_mb": round(swap.used / 1_000_000.0, 1),
+        "disk_read_bytes": float(disk.read_bytes) if disk else 0.0,
+    }
+
+
+def disk_io_snapshot() -> dict[str, float]:
+    """Cumulative block-device reads and writes at this instant, or zeros without psutil.
+
+    Sampled before and after a request so the bytes the drive actually served during that
+    request can be compared with the figure the engine's counters imply. It is an aggregate
+    over every block device, so it is a cross-check, not a measurement of the pack's reads:
+    anything else the host is doing is in the number too.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return {"read_bytes": 0.0, "write_bytes": 0.0}
+    try:
+        counters = psutil.disk_io_counters()
+    except (RuntimeError, OSError):
+        return {"read_bytes": 0.0, "write_bytes": 0.0}
+    if not counters:
+        return {"read_bytes": 0.0, "write_bytes": 0.0}
+    return {"read_bytes": float(counters.read_bytes), "write_bytes": float(counters.write_bytes)}
+
+
+def _apply_tier(block: dict[str, Any], tier_mib: int | None) -> dict[str, Any]:
+    """Add the residency verdict for a pinned tier to an ambient block.
+
+    `tier_resident` is False when the free host RAM is smaller than the tier the engine
+    is about to pin. No tier, no claim.
+    """
+    if tier_mib is None:
+        return block
+    block["tier_mib"] = int(tier_mib)
+    free_ram = block.get("free_ram_mb")
+    if free_ram is not None:
+        block["tier_headroom_mb"] = round(float(free_ram) - float(tier_mib), 1)
+        block["tier_resident"] = float(free_ram) >= float(tier_mib)
+    return block
+
+
+def ambient_state(tier_mib: int | None = None) -> dict[str, Any]:
+    """Free VRAM, GPU processes, and host memory at the instant a trial runs.
+
+    `tier_mib` is the `vram` value of the configuration about to be measured. When it is
+    given, the block also reports whether that tier can stay resident in the free RAM
+    (`tier_resident`) and how much headroom is left (`tier_headroom_mb`): the variable
+    that decides `vram_hit`.
 
     `TUNE_AMBIENT_JSON` pins the answer for tests and for a machine without nvidia-smi.
     A probe that cannot answer reports zero/empty rather than raising: the sweep needs a
@@ -233,13 +301,15 @@ def ambient_state() -> dict[str, Any]:
         try:
             data = json.loads(pinned)
             if isinstance(data, dict):
-                return data
+                return _apply_tier(data, tier_mib)
         except ValueError:
             pass
-    return {
+    out: dict[str, Any] = {
         "free_vram_mib": free_vram_mib(),
         "gpu_processes": gpu_processes(),
     }
+    out.update(memory_state())
+    return _apply_tier(out, tier_mib)
 
 
 def pci_from_lspci() -> tuple[int, int]:

@@ -54,8 +54,10 @@
 # Run data is kept per machine in HyperCore-Tune-Maya/history/, named
 #   <CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
 # so a sweep on the same box reuses what it already measured instead of booting again,
-# and keeps drawing until --trials new points have been evaluated.
+# and keeps drawing until --trials new points have been evaluated. A configuration measured
+# under another objective is the same fourteen flags, so it is not booted a second time.
 #   --no-load                   start the study cold
+#   --no-cross-objective        only reuse points measured under this objective
 #   --allow-hardware-mismatch   load run data from a different machine too
 #   --hardware '<json>'         pin the fingerprint instead of probing the host
 #   --replay <record.json>      rewrite the deliverables from a finished sweep, no engine boot

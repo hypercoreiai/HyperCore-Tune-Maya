@@ -30,8 +30,9 @@ model, objective and context:
     <CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
 
 A sweep on the same machine loads it, never re-boots a configuration it has already
-measured, seeds the TPE sampler with those trials, and keeps drawing until --trials
-unseen configurations have been evaluated. --no-load starts cold; a record from
+measured - including one measured under a different objective, since the same fourteen
+flags boot the same run - seeds the TPE sampler with those trials, and keeps drawing until
+--trials unseen configurations have been evaluated. --no-load starts cold; a record from
 different hardware is ignored unless --allow-hardware-mismatch is given.
 
 Run it through the project venv:  ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --gen --cntx 131072
@@ -63,17 +64,25 @@ except ImportError:  # GPSampler needs scipy; it is optional here.
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engine_runner import (
+    DEFAULT_THINK_END,
     THINK_BUDGET_KEY,
     THINK_END_KEY,
     EngineSession,
     Metrics,
     build_prompt,
     run_config,
+    think_end_token,
     vocab_size,
 )
 from hardware import Hardware, ambient_state, fingerprint, free_vram_mib, hardware_from
 from history import dedupe as dedupe_priors
-from history import distributions_for, find_history, history_path, usable_trials
+from history import (
+    distributions_for,
+    find_history,
+    history_path,
+    other_objective_history,
+    usable_trials,
+)
 from history import load as load_history
 from history import save as save_history
 from maya_env import abs_path, engine_binary, maya_root
@@ -142,6 +151,26 @@ def signed_score(m: Metrics, objective: str) -> float:
     """
     if not m.ok():
         return PENALTY[objective]
+    if objective == "decode":
+        return m.decode_tok_s
+    if objective == "think":
+        return m.thinking_tok_s
+    if objective == "prefill":
+        return m.prefill_tok_s
+    if objective == "balance":
+        return balance_score(m.decode_tok_s, m.transfer)
+    return -m.latency_ms
+
+
+def prior_score(m: Metrics, objective: str) -> float:
+    """What an already-measured configuration is worth under this objective.
+
+    `signed_score` gates on status because a live trial that failed to boot has to score at
+    the bottom of the range. A prior carried in from history has no status of its own, only
+    the numbers a previous sweep recorded, so the same arithmetic is applied without that
+    gate. A configuration measured under a different objective is re-scored here: its stored
+    score belongs to that objective and cannot be compared with this one.
+    """
     if objective == "decode":
         return m.decode_tok_s
     if objective == "think":
@@ -271,16 +300,32 @@ class Sweeper:
     """Runs the study, keeps the incumbent best, and writes the deliverables."""
 
     def __init__(self, args: argparse.Namespace, root: Path, params: list[Param], paths,
-                 hw: Hardware, priors: list[dict[str, Any]]) -> None:
+                 hw: Hardware, priors: list[dict[str, Any]],
+                 foreign: list[dict[str, Any]] | None = None) -> None:
         self.args = args
         self.root = root
         self.params = params
         self.paths = paths
         self.hw = hw
         self.priors = priors
+        # Configurations already measured on this machine under a different objective. They
+        # are not priors for this study - their scores belong to another objective - but
+        # they have been booted, so they must not be booted again.
+        self.foreign: list[dict[str, Any]] = []
         # One expert blob, from the pack's own index, so reads/tok can be stated in bytes/s.
         self.blob_bytes = expert_blob_bytes(self.paths.pack) if self.paths.pack else None
+        # The id that closes a reasoning block has to be the pack's own. A guessed id is
+        # accepted by the engine and silently breaks the thinking/answer split, so it is read
+        # from the tokenizer rather than assumed.
+        if args.think_end is None:
+            self.think_end = think_end_token(self.paths.tokenizer) or DEFAULT_THINK_END
+            if self.think_end != DEFAULT_THINK_END:
+                print(f"think-end: this pack closes reasoning with token {self.think_end}")
+        else:
+            self.think_end = args.think_end
         self.priors_loaded = len(priors)
+        self.foreign_loaded = 0
+        self.foreign_skipped = 0
         self.rows: list[TrialRow] = []
         self.seen: set[tuple[object, ...]] = set()
         self.prior_rows: dict[tuple[object, ...], TrialRow] = {}
@@ -307,13 +352,19 @@ class Sweeper:
         )
         if self.frozen:
             self.priors = [p for p in priors if _cfg_matches_frozen(p.get("cfg", {}), self.frozen)]
+            self.foreign = [p for p in (foreign or [])
+                            if _cfg_matches_frozen(p.get("cfg", {}), self.frozen)]
+        else:
+            self.foreign = list(foreign or [])
         self.priors = self._usable_priors(self.priors)
+        self.foreign = self._usable_priors(self.foreign, foreign=True)
         self.model = args.model.lower()
         self.session: EngineSession | None = None
         self.session_topology: tuple[str, ...] | None = None
         self._seed_from_history()
 
-    def _usable_priors(self, priors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _usable_priors(self, priors: list[dict[str, Any]], *,
+                       foreign: bool = False) -> list[dict[str, Any]]:
         """The priors this run's grid can hold, one per configuration.
 
         A prior outside the bounds asked for (--vram-max, --max-workers) cannot seed the
@@ -323,33 +374,47 @@ class Sweeper:
         the same reason: its tok/s is not a number this sweep could reproduce, and a
         winner taken from it would be a number the user cannot check.
         Two records that normalise to the same configuration are folded into the better one.
+
+        `foreign` marks the list that came from another objective. Those configurations are
+        kept for the same reasons - they are still measurements of this machine - but a
+        configuration the study already has a prior for is not carried twice.
         """
         kept: list[dict[str, Any]] = []
         engine = str(self.args.engine)
         prompt_tokens = len(self.prompt_ids)
+        known = {tuple(p["signature"]) for p in self.priors}
+        skipped = 0
         for prior in priors:
+            if foreign and tuple(prior.get("signature", ())) in known:
+                continue
             try:
                 distributions_for(self.params, prior.get("cfg", {}))
             except ValueError as exc:
-                self.priors_skipped += 1
+                skipped += 1
                 self._seed_note(prior.get("cfg", {}), exc)
                 continue
             recorded_engine = str(prior.get("engine", "") or "")
             if recorded_engine and recorded_engine != engine:
-                self.priors_skipped += 1
+                skipped += 1
                 self._seed_note(prior.get("cfg", {}),
                                 f"measured with a different engine ({recorded_engine})")
                 continue
             recorded_prompt = int(prior.get("prompt_tokens", 0) or 0)
             if recorded_prompt and recorded_prompt != prompt_tokens:
-                self.priors_skipped += 1
+                skipped += 1
                 self._seed_note(prior.get("cfg", {}),
                                 f"measured on a {recorded_prompt}-token prompt, this run "
                                 f"uses {prompt_tokens}")
                 continue
             kept.append(prior)
         deduped = dedupe_priors(kept)
-        self.priors_merged = len(kept) - len(deduped)
+        merged = len(kept) - len(deduped)
+        if foreign:
+            self.foreign_skipped = skipped
+            self.foreign_loaded = len(deduped)
+        else:
+            self.priors_skipped = skipped
+            self.priors_merged = merged
         return deduped
 
     def _seed_from_history(self) -> None:
@@ -358,8 +423,14 @@ class Sweeper:
         Priors are seeds: they warm the sampler and they are the number the sweep is trying
         to beat. They are not the winner - the launcher a sweep writes out has to be a
         configuration this run actually measured on this machine.
+
+        The `foreign` list is the same kind of measurement, taken under a different
+        objective. It seeds nothing - its scores are not this objective's scores - but every
+        configuration in it goes into `seen`, so the study never boots a point this machine
+        has already measured. Its score is recomputed for the objective being run.
         """
-        for prior in self.priors:
+        for prior, is_foreign in [(p, False) for p in self.priors] + \
+                                [(p, True) for p in self.foreign]:
             stored = prior["metrics"]
             metrics = Metrics(status="CACHED")
             metrics.decode_tok_s = float(stored.get("decode_tok_s", stored.get("gen_tok_s", 0.0)) or 0.0)
@@ -373,8 +444,11 @@ class Sweeper:
             metrics.answer_ms = float(stored.get("answer_ms", 0.0) or 0.0)
             metrics.generated = int(stored.get("generated", 0) or 0)
             metrics.prompt_tokens = int(stored.get("prompt_tokens", 0) or 0)
+            metrics.transfer = prior.get("transfer", {}) or {}
+            score = (prior_score(metrics, self.args.objective) if is_foreign
+                     else float(prior["score"]))
             row = TrialRow(layer="history", cfg=dict(prior["cfg"]),
-                          metrics=metrics, score=float(prior["score"]),
+                          metrics=metrics, score=score,
                           from_history=True, engine=str(prior.get("engine", "")))
             sig = tuple(prior["signature"])
             self.seen.add(sig)
@@ -433,7 +507,7 @@ class Sweeper:
                 self.best_row = row
             return row
 
-        ambient = ambient_state()
+        ambient = ambient_state(cfg.get("vram"))
         ambient["captured_utc"] = utc_stamp()
         boot_args = engine_args(cfg, self.paths.as_dict(), self.args.cntx,
                                 self.args.max_new, draft_floor_of(self.args),
@@ -441,7 +515,7 @@ class Sweeper:
         keys = request_keys(cfg) if self.args.two_stage else {}
         if self.args.think_budget > 0:
             keys[THINK_BUDGET_KEY] = self.args.think_budget
-            keys[THINK_END_KEY] = self.args.think_end
+            keys[THINK_END_KEY] = self.think_end
         top_sig = topology_signature(cfg, self.params) if self.args.two_stage else None
         runs: list[Metrics] = []
 
@@ -734,7 +808,7 @@ class Sweeper:
                 "repeat": self.args.repeat,
                 # The reasoning split only exists when the request asked for one.
                 "think_budget": self.args.think_budget,
-                "think_end": self.args.think_end if self.args.think_budget > 0 else None,
+                "think_end": self.think_end if self.args.think_budget > 0 else None,
             },
             # The best prior this machine has ever recorded. Kept so a run can be compared
             # with the numbers it started from; it is never the winner.
@@ -766,6 +840,10 @@ class Sweeper:
                 "priors_skipped": self.priors_skipped,
                 "priors_merged": self.priors_merged,
                 "priors_used": len(self.priors),
+                # Configurations already booted under another objective: not priors for this
+                # study, but not worth booting a second time either.
+                "foreign_seen": self.foreign_loaded,
+                "foreign_skipped": self.foreign_skipped,
                 "reused": sum(1 for r in self.rows if r.from_history),
                 "duplicates_skipped": self.duplicates_skipped,
             },
@@ -823,9 +901,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--think-budget", type=int, default=0,
                    help="tokens the request may reason before answering (GEN key "
                         "think_budget); 0 sends no thinking keys. --think needs one.")
-    p.add_argument("--think-end", type=int, default=151667,
-                   help="the pack's think-end token id, the token the engine forces when a "
-                        "reasoning block closes (the pack's <|im_start|>)")
+    p.add_argument("--think-end", type=int, default=None,
+                   help="the token id the engine forces when a reasoning block closes (GEN key "
+                        "think_end). Defaults to the pack's own: </think> if its tokenizer "
+                        "names one, otherwise its end-of-turn token. An id the model does not "
+                        "have is emitted as ordinary text, so the reasoning split never fires "
+                        "and the sweep reports thinking 0.0 tok/s.")
     p.add_argument("--cntx", "--context", type=int, default=32768, dest="cntx",
                    help="context length the sweep is tuned at")
     p.add_argument("--trials", type=int, default=40,
@@ -924,6 +1005,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="load run data from this file instead of the machine-matched one")
     p.add_argument("--no-load", action="store_true",
                    help="ignore previous runs; start the study cold")
+    p.add_argument("--no-cross-objective", action="store_true",
+                   help="only reuse configurations measured under this objective; a point "
+                        "measured under another one would be booted again")
     p.add_argument("--allow-hardware-mismatch", action="store_true",
                    help="load run data even when it was measured on different hardware")
     p.add_argument("--hardware", default=None,
@@ -967,7 +1051,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.objective = LEGACY_OBJECTIVE.get(args.objective, args.objective)
     if args.think_budget < 0:
         p.error("--think-budget cannot be negative")
-    if args.think_end < 0:
+    if args.think_end is not None and args.think_end < 0:
         p.error("--think-end is a token id and cannot be negative")
     if args.objective == "think" and args.think_budget == 0:
         p.error("--think measures the reasoning block, so it needs --think-budget N; "
@@ -1271,6 +1355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return rebuild_from_records(args, paths, hw)
 
     priors: list[dict[str, Any]] = []
+    foreign: list[dict[str, Any]] = []
     sources: list[Path] = []
     if args.no_load:
         print("history: --no-load, starting cold")
@@ -1291,6 +1376,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(f"history: nothing for {hw.slug()} / {args.model} / {args.objective} "
                   f"/ {args.cntx}; starting cold")
+        # A configuration measured under another objective has already been booted on this
+        # machine with these flags. Its score is not this objective's score, so it is not a
+        # prior; it is a point the study must not waste a boot on.
+        if not args.history_file and not args.no_cross_objective:
+            foreign_sources = other_objective_history(
+                args.history_dir, args.model, args.cntx, hw,
+                allow_mismatch=args.allow_hardware_mismatch, objective=args.objective)
+            for source in foreign_sources:
+                record = load_history(source)
+                if record:
+                    fill = record.get("spec_min_p")
+                    foreign.extend(usable_trials(
+                        record, args.max_new, 0.8 if fill is None else float(fill),
+                        pack=paths.pack))
+            if foreign:
+                print(f"history: {len(foreign)} configurations measured under another "
+                      f"objective ({', '.join(str(s.name) for s in foreign_sources)}) "
+                      f"will not be booted again")
 
     print(f"optuna {optuna.__version__} | objective {args.objective} | mode {args.mode} "
           f"| sampler {args.sampler} | seed {args.seed} | context {args.cntx} "
@@ -1302,7 +1405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("frozen: " + ", ".join(f"{k}={v}" for k, v in frozen.items()))
     preflight(args, paths, hw)
 
-    sweeper = Sweeper(args, root, params, paths, hw, priors)
+    sweeper = Sweeper(args, root, params, paths, hw, priors, foreign)
     t0 = time.monotonic()
     interrupted = sweeper.run()
     elapsed = time.monotonic() - t0
@@ -1364,6 +1467,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("frontier: configurations nothing else beats on both rate and bus")
                 for line in lines:
                     print(line)
+        amb = winner.metrics.ambient or {}
+        if amb.get("swap_used_mb", 0) > 0 or amb.get("tier_resident") is False:
+            print(f"ambient: {amb.get('free_ram_mb', 0):.0f} MB free of "
+                  f"{amb.get('total_ram_mb', 0):.0f} MB host RAM, "
+                  f"{amb.get('swap_used_mb', 0):.0f} MB in swap; the "
+                  f"{amb.get('tier_mib', 0)} MiB tier has "
+                  f"{amb.get('tier_headroom_mb', 0):.0f} MB headroom - a tier that "
+                  f"cannot stay resident sets vram_hit, not the swept knobs")
         if winner.from_history:
             print("note: this configuration was carried in from history; nothing was "
                   "booted in this run, so these numbers are not from this sweep")

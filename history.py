@@ -73,6 +73,36 @@ def history_path(history_dir: Path, model: str, objective: str, context: int,
     return history_dir / f"{slug(hw)}_{model.lower()}_{objective}_{context}.json"
 
 
+def other_objective_history(history_dir: Path, model: str, context: int, hw: Hardware,
+                           objective: str, allow_mismatch: bool = False) -> list[Path]:
+    """History files for this model, context and machine measured under a *different* objective.
+
+    A configuration is a configuration: the same fourteen flags boot the same engine run
+    whether the sweep was asked to maximise throughput or to discount the bus. Those files
+    are never merged into the priors - a score from one objective is not a score for
+    another - but the configurations they contain have already been booted on this machine,
+    so a sweep should not boot them a second time to get the same numbers again.
+    """
+    if not history_dir.is_dir():
+        return []
+    mine = set(_objective_names(objective))
+    found: list[Path] = []
+    for path in sorted(history_dir.glob(f"*_{model.lower()}_*_{context}.json")):
+        record = load(path)
+        if record is None or str(record.get("objective", "")) in mine:
+            continue
+        diffs = differences(hw, hardware_from(record))
+        if diffs:
+            if allow_mismatch:
+                print(f"note: {path.name} was measured on another machine "
+                      f"({'; '.join(diffs)}); its configurations are carried over because "
+                      f"--allow-hardware-mismatch was passed", file=sys.stderr)
+                found.append(path)
+            continue
+        found.append(path)
+    return found
+
+
 def load(path: Path) -> dict[str, Any] | None:
     """A record, or None if the file is missing, unreadable or not a history file."""
     try:
@@ -142,6 +172,12 @@ def normalise_trial(row: dict[str, Any], max_new: int, spec_min_p: float,
     ambient = row.get("ambient")
     if not isinstance(ambient, dict):
         ambient = {}
+    # The transfer telemetry travels with the trial. Without it a prior can still be
+    # compared on throughput, but --balance has no bus share to discount by and falls back
+    # to the plain rate rather than guessing one.
+    transfer = row.get("transfer")
+    if not isinstance(transfer, dict):
+        transfer = {}
     return {
         "cfg": cfg,
         "signature": list(signature(cfg)),
@@ -149,6 +185,7 @@ def normalise_trial(row: dict[str, Any], max_new: int, spec_min_p: float,
         "status": str(row.get("status", "UNKNOWN")),
         "layer": str(row.get("layer", "history")),
         "metrics": {k: float(v) if v is not None else 0.0 for k, v in metrics.items()},
+        "transfer": transfer,
         "ambient": ambient,
         # Provenance: which binary produced these numbers and on how many prompt tokens.
         # A prior from another engine or another prompt is not a number this sweep could

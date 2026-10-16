@@ -93,7 +93,7 @@ TRANSFER_WEIGHT = 0.35
 TRANSFER_COLUMNS: tuple[str, ...] = (
     "decode_ms_per_tok", "off_card_ms_per_tok", "transfer_share", "off_card_lookup_share",
     "compute_tok_s", "headroom", "disk_ms_per_read", "disk_saturation", "measured_times",
-    "disk_bytes_per_s", "pcie_bytes_per_s", "disk_reads_per_tok", "disk_ms_per_tok",
+    "disk_bytes_per_s", "measured_disk_bytes_per_s", "disk_attribution", "pcie_bytes_per_s", "disk_reads_per_tok", "disk_ms_per_tok",
     "ram_fetches_per_tok", "promotions_per_tok", "cpu_experts_per_tok", "cpu_ms_per_tok",
     "vram_hit_pct", "kv_hit_pct", "kv_mib_from_ram", "spec_accepted", "spec_steps", "flags",
 )
@@ -248,6 +248,9 @@ class Transfer:
     spec_steps: int = 0
     disk_skips_per_tok: float = 0.0
     blob_bytes: float | None = DEFAULT_BLOB_BYTES
+    # Bytes the host's block devices actually served during the request, per second.
+    # None when psutil is unavailable or nothing measurable crossed the drive.
+    measured_disk_bytes_per_s: float | None = None
     # The engine's own unit costs, from its boot lines. None when it printed none.
     cpu_ms_per_expert: float | None = None
     pcie_ms_per_expert: float | None = None
@@ -259,7 +262,8 @@ class Transfer:
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_lines(cls, lines: Iterable[str], blob_bytes: float | None = None) -> Transfer:
+    def from_lines(cls, lines: Iterable[str], blob_bytes: float | None = None,
+                   measured_disk_bytes_per_s: float | None = None) -> Transfer:
         """Fold every telemetry line in an engine log into one record.
 
         The per-request summary (`glm stat`) wins where it exists: it is the engine's own
@@ -294,8 +298,10 @@ class Transfer:
             elif "tiers warm:" in line:
                 warm = parse_warm_line(line) or warm
         if not stats and not live and not kv and not spec and not skip:
-            return Transfer(blob_bytes=blob_bytes)
-        out = Transfer(blob_bytes=blob_bytes, stat_lines=len(stats), live_lines=len(live))
+            return Transfer(blob_bytes=blob_bytes,
+                           measured_disk_bytes_per_s=measured_disk_bytes_per_s)
+        out = Transfer(blob_bytes=blob_bytes, stat_lines=len(stats), live_lines=len(live),
+                       measured_disk_bytes_per_s=measured_disk_bytes_per_s)
         out.cpu_ms_per_expert = costs.get("cpu_ms_per_expert")
         out.pcie_ms_per_expert = costs.get("pcie_ms_per_expert")
         out.ram_ms_per_expert = costs.get("ram_ms_per_expert")
@@ -489,6 +495,20 @@ class Transfer:
             out.append("almost nothing is resident on the card")
         return out
 
+    @property
+    def disk_attribution(self) -> float | None:
+        """Measured drive traffic divided by the traffic the engine's counters imply.
+
+        1.0 means the derived figure matched what the host actually read. It is None when
+        either side is unavailable. Values far from 1 say the attribution is wrong - the
+        engine pipelines reads, or the host is doing other I/O - and the derived share
+        should be read as a bound rather than a measurement.
+        """
+        derived = self.disk_bytes_per_s
+        if not self.measured_disk_bytes_per_s or not derived:
+            return None
+        return float(self.measured_disk_bytes_per_s) / float(derived)
+
     def summary(self) -> str:
         """One line: what the bus is doing for this configuration, and how it was worked out.
 
@@ -511,6 +531,10 @@ class Transfer:
         saturation = self.disk_saturation
         if saturation is not None:
             parts.append(f"the drive at {saturation:.0%} of its measured {self.disk_gb_per_s:.2f} GB/s")
+        attribution = self.disk_attribution
+        if attribution is not None:
+            parts.append(f"host counters read {self.measured_disk_bytes_per_s / 1e6:.0f} MB/s "
+                        f"({attribution:.2f}x the derived traffic)")
         ceiling = self.compute_tok_s
         headroom = ""
         if ceiling > 0 and self.decode_ms_per_tok > 0 and ceiling > 1000.0 / self.decode_ms_per_tok:
@@ -533,6 +557,10 @@ class Transfer:
             "headroom": round(self.headroom, 3),
             "disk_bytes_per_s": (round(self.disk_bytes_per_s, 1)
                                  if self.disk_bytes_per_s is not None else None),
+            "measured_disk_bytes_per_s": (round(self.measured_disk_bytes_per_s, 1)
+                                         if self.measured_disk_bytes_per_s else None),
+            "disk_attribution": (round(self.disk_attribution, 3)
+                                 if self.disk_attribution is not None else None),
             "pcie_bytes_per_s": (round(self.pcie_bytes_per_s, 1)
                                  if self.pcie_bytes_per_s is not None else None),
             "disk_reads_per_tok": round(self.disk_reads_per_tok, 2),

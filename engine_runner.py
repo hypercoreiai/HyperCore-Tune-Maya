@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from hardware import disk_io_snapshot
 from transfer import Transfer
 
 DONE_MIN_FIELDS = 6
@@ -101,6 +102,7 @@ class Metrics:
     thinking_tokens: int = 0
     answer_tokens: int = 0
     thinking: bool = False        # the request carried a thinking budget
+    measured_disk_read_bytes: float = 0.0   # host block reads during the request, from psutil
     prompt_tokens: int = 0
     prompt_read: int = 0
     generated: int = 0
@@ -303,6 +305,47 @@ def vocab_size(tokenizer_dir: str | None, pack: str | None) -> int | None:
                         return n
         except (OSError, ValueError, IndexError):
             pass
+    return None
+
+
+# The token a pack uses to close a reasoning block. The engine forces `think_end` when a
+# thinking budget runs out (generate.cpp:1769), so the id has to be the model's own. A wrong
+# id is not rejected: it is emitted as an ordinary token, the reasoning split never fires, and
+# the sweep reports thinking 0.0 tok/s while still measuring decode correctly.
+THINK_END_TOKENS = ("</think>", "<|im_end|>", "<|endoftext|>")
+DEFAULT_THINK_END = 151667
+
+
+def think_end_token(tokenizer_dir: str | None) -> int | None:
+    """The close-of-think id this pack really has, or None when it carries no tokenizer.
+
+    Reads `vocab.json` (a plain token -> id map) first, then `tokenizer.json`'s added
+    tokens. Nothing is guessed: if the pack names none of THINK_END_TOKENS the caller falls
+    back to DEFAULT_THINK_END and says so.
+    """
+    if not tokenizer_dir:
+        return None
+    root = Path(tokenizer_dir)
+    vocab = root / "vocab.json"
+    if vocab.is_file():
+        try:
+            data = json.loads(vocab.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            for token in THINK_END_TOKENS:
+                if isinstance(data.get(token), int):
+                    return int(data[token])
+    tok = root / "tokenizer.json"
+    if tok.is_file():
+        try:
+            data = json.loads(tok.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        entries = data.get("added_tokens", []) if isinstance(data, dict) else []
+        for entry in entries:
+            if entry.get("token") in THINK_END_TOKENS and isinstance(entry.get("id"), int):
+                return int(entry["id"])
     return None
 
 
@@ -620,9 +663,17 @@ class EngineSession:
         max_new: int,
         request_keys: dict[str, object] | None = None,
     ) -> Metrics:
-        """Send one GEN request to the already-running engine."""
+        """Send one GEN request to the already-running engine.
+
+        The host's block-device counters are sampled before and after the request so the
+        bytes the drive really served can be set against the figure the engine's own
+        read counts imply. That is the only part of the transfer picture that can be
+        measured independently of the engine; PCIe traffic needs NVML, which this
+        environment does not have.
+        """
         metrics = Metrics(log_path=str(self.log_path), effective=dict(self.effective or self.info))
         t_start = time.monotonic()
+        disk_before = disk_io_snapshot()
 
         if self.start_error:
             metrics.status = "FAIL_EXEC"
@@ -676,6 +727,10 @@ class EngineSession:
             done = None
 
         metrics.wall_ms = (time.monotonic() - t_start) * 1000.0
+        disk_after = disk_io_snapshot()
+        metrics.measured_disk_read_bytes = max(
+            0.0, disk_after["read_bytes"] - disk_before["read_bytes"]
+        )
         log_text = "\n".join(self.lines)
         metrics.effective = dict(self.effective or self.info)
 
@@ -730,7 +785,12 @@ class EngineSession:
         if metrics.thinking and thinking_tokens == 0:
             metrics.note = ("the request carried a thinking budget but the model answered "
                            "without a reasoning block, so thinking is not measured")
-        metrics.transfer = Transfer.from_lines(self.lines, blob_bytes=self.blob_bytes).as_dict()
+        measured_disk_s = (metrics.measured_disk_read_bytes / (metrics.wall_ms / 1000.0)
+                           if metrics.wall_ms > 0 and metrics.measured_disk_read_bytes else None)
+        metrics.transfer = Transfer.from_lines(
+            self.lines, blob_bytes=self.blob_bytes,
+            measured_disk_bytes_per_s=measured_disk_s,
+        ).as_dict()
         return metrics
 
     def alive(self) -> bool:
