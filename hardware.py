@@ -177,6 +177,71 @@ def detect_gpus() -> tuple[tuple[str, ...], int]:
     return tuple(found), 0
 
 
+def free_vram_mib() -> int:
+    """VRAM free right now, summed over the visible GPUs. 0 when nothing reports it.
+
+    A sweep's failures are read as configurations, not as a busy GPU, so the caller needs
+    this before the first boot rather than after fifty of them.
+    """
+    out = _run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader"])
+    total = 0
+    for line in out.splitlines():
+        digits = re.sub(r"[^\d]", "", line)
+        if digits:
+            total += int(digits)
+    return total
+
+
+def gpu_processes() -> list[dict[str, Any]]:
+    """The compute processes holding GPU memory right now, as nvidia-smi reports them.
+
+    A failed or slow trial is hard to read without this: "out of memory" may be the
+    configuration, or the browser that was already on the card.
+    """
+    out = _run([
+        "nvidia-smi",
+        "--query-compute-apps=pid,process_name,used_memory",
+        "--format=csv,noheader",
+    ])
+    procs: list[dict[str, Any]] = []
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            pid = 0
+        used = re.sub(r"[^\d]", "", parts[2])
+        procs.append({
+            "pid": pid,
+            "name": parts[1],
+            "used_memory_mib": int(used) if used else 0,
+        })
+    return procs
+
+
+def ambient_state() -> dict[str, Any]:
+    """Free VRAM and GPU processes at the instant a trial is about to run.
+
+    `TUNE_AMBIENT_JSON` pins the answer for tests and for a machine without nvidia-smi.
+    A probe that cannot answer reports zero/empty rather than raising: the sweep needs a
+    value for every trial, not a crash on a missing tool.
+    """
+    pinned = os.environ.get("TUNE_AMBIENT_JSON")
+    if pinned:
+        try:
+            data = json.loads(pinned)
+            if isinstance(data, dict):
+                return data
+        except ValueError:
+            pass
+    return {
+        "free_vram_mib": free_vram_mib(),
+        "gpu_processes": gpu_processes(),
+    }
+
+
 def pci_from_lspci() -> tuple[int, int]:
     """The negotiated link lspci reports, or (0, 0) when lspci is not installed.
 

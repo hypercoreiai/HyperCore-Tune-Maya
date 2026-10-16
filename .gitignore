@@ -5,6 +5,9 @@ history/
 maya-*.json
 run-maya-*.sh
 run-maya-*.bat
+max_*_config.json
+max_*_run.sh
+max_*_run.bat
 maya-*.pid
 maya-*.fifo
 

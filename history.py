@@ -13,6 +13,12 @@ them. Loading it does three things:
      instead of from a cold prior;
   3. a suggestion that matches one of them is redrawn, so --trials means new points.
 
+A prior is a seed, not a result. The sweep reports the best configuration it booted itself;
+the best prior is kept alongside it as the number to beat. Each stored trial records the
+engine binary and the prompt length that produced its numbers, and a prior from a different
+engine or a different prompt is dropped rather than merged: two tok/s figures are only
+comparable when the same binary read the same prompt.
+
 draft_floor is part of the configuration signature. Older records that stored it only as
 the run-level spec_min_p still load: the missing key is filled from that field.
 
@@ -30,13 +36,35 @@ from pathlib import Path
 from typing import Any
 
 from hardware import Hardware, differences, hardware_from, slug
-from search_space import Config, Param, signature
+from search_space import (
+    DEFAULT_CONFIG,
+    ROW_COLUMNS,
+    Config,
+    Param,
+    effective_kv,
+    signature,
+)
 
 SCHEMA = "hypercore.tuning_history/1"
-CFG_KEYS: tuple[str, ...] = (
-    "vram", "pcie", "pcie_mode", "ple_io", "kv", "kvstream", "hostworker", "worker",
-    "tail", "draft_floor",
-)
+# The metric names a history file may carry for the same measurement: a sweep written
+# before the decode phase was named after the engine's own `decode_ms` used "gen". Both
+# are read; only the current one is written.
+OBJECTIVE_ALIASES: dict[str, tuple[str, ...]] = {"decode": ("gen",)}
+# The dimensions a record must carry, taken from the space itself so the two never drift
+# apart. A record written before a dimension existed is filled in with the engine's own
+# default for it - that is what the run it measured actually did.
+CFG_KEYS: tuple[str, ...] = ROW_COLUMNS[1:-1]
+
+
+def _objective_names(objective: str) -> tuple[str, ...]:
+    """This objective and every older spelling of it, so a pre-decode history is found."""
+    names = [objective]
+    for canonical, aliases in OBJECTIVE_ALIASES.items():
+        if objective == canonical:
+            names.extend(aliases)
+        elif objective in aliases:
+            names.append(canonical)
+    return tuple(dict.fromkeys(names))
 
 
 def history_path(history_dir: Path, model: str, objective: str, context: int,
@@ -62,9 +90,9 @@ def find_history(history_dir: Path, model: str, objective: str, context: int,
     """Every history file for this model/objective/context whose machine matches."""
     if not history_dir.is_dir():
         return []
-    needle = f"_{model.lower()}_{objective}_{context}.json"
+    needles = [f"_{model.lower()}_{name}_{context}.json" for name in _objective_names(objective)]
     found: list[Path] = []
-    for path in sorted(history_dir.glob("*" + needle)):
+    for path in sorted(p for needle in needles for p in history_dir.glob("*" + needle)):
         record = load(path)
         if record is None:
             continue
@@ -79,27 +107,41 @@ def find_history(history_dir: Path, model: str, objective: str, context: int,
     return found
 
 
-def normalise_trial(row: dict[str, Any], max_new: int, spec_min_p: float) -> dict[str, Any] | None:
-    """A stored trial, or None if it is missing the fields a prior needs."""
+def normalise_trial(row: dict[str, Any], max_new: int, spec_min_p: float,
+                    pack: str | Path | None = None) -> dict[str, Any] | None:
+    """A stored trial, or None if it is missing the fields a prior needs.
+
+    `pack` is the pack the sweep is about to run: a --kv the pack's runner ignores is
+    rewritten to the mode that actually ran (see effective_kv), so a measurement taken with
+    a no-op flag still seeds the study as the run it was.
+    """
     cfg_raw = row.get("cfg")
     if not isinstance(cfg_raw, dict):
         cfg_raw = {k: row[k] for k in CFG_KEYS if k in row}
     cfg: Config = {}
     for key in CFG_KEYS:
-        if key not in cfg_raw:
+        if key in cfg_raw:
+            cfg[key] = cfg_raw[key]
+        elif key == "draft_floor":
             # Pre-draft_floor records stored the floor on the run, not the trial.
-            if key == "draft_floor":
-                cfg[key] = float(row.get("spec_min_p", spec_min_p))
-                continue
-            return None
-        cfg[key] = cfg_raw[key]
+            cfg[key] = float(row.get("spec_min_p", spec_min_p))
+        else:
+            cfg[key] = DEFAULT_CONFIG[key]
+    if pack is not None and "kv" in cfg_raw:
+        cfg["kv"] = effective_kv(pack, str(cfg_raw["kv"]))
     try:
         score = float(row.get("score", 0.0))
     except (TypeError, ValueError):
         return None
     metrics = row.get("metrics") or {k: row.get(k) for k in
-                                    ("gen_tok_s", "prefill_tok_s", "latency_ms",
-                                     "prompt_ms", "decode_ms")}
+                                    ("decode_tok_s", "gen_tok_s", "thinking_tok_s",
+                                     "answer_tok_s", "prefill_tok_s", "latency_ms",
+                                     "prompt_ms", "decode_ms", "think_ms", "answer_ms")}
+    if "decode_tok_s" not in metrics and "gen_tok_s" in metrics:
+        metrics["decode_tok_s"] = metrics["gen_tok_s"]
+    ambient = row.get("ambient")
+    if not isinstance(ambient, dict):
+        ambient = {}
     return {
         "cfg": cfg,
         "signature": list(signature(cfg)),
@@ -107,6 +149,12 @@ def normalise_trial(row: dict[str, Any], max_new: int, spec_min_p: float) -> dic
         "status": str(row.get("status", "UNKNOWN")),
         "layer": str(row.get("layer", "history")),
         "metrics": {k: float(v) if v is not None else 0.0 for k, v in metrics.items()},
+        "ambient": ambient,
+        # Provenance: which binary produced these numbers and on how many prompt tokens.
+        # A prior from another engine or another prompt is not a number this sweep could
+        # reproduce, and _usable_priors drops it rather than letting it win.
+        "engine": str(row.get("engine", "") or ""),
+        "prompt_tokens": int(row.get("prompt_tokens", 0) or 0),
         "max_new": int(row.get("max_new", max_new)),
         "spec_min_p": float(row.get("spec_min_p", spec_min_p)),
         "measured_utc": str(row.get("measured_utc", "")),
@@ -115,7 +163,8 @@ def normalise_trial(row: dict[str, Any], max_new: int, spec_min_p: float) -> dic
     }
 
 
-def usable_trials(record: dict[str, Any], max_new: int, spec_min_p: float) -> list[dict[str, Any]]:
+def usable_trials(record: dict[str, Any], max_new: int, spec_min_p: float,
+                  pack: str | Path | None = None) -> list[dict[str, Any]]:
     """Trials whose request shape matches the sweep about to run.
 
     Metrics only compare against each other when the prompt and the generation length are
@@ -127,13 +176,27 @@ def usable_trials(record: dict[str, Any], max_new: int, spec_min_p: float) -> li
     for row in record.get("trials", []):
         if not isinstance(row, dict):
             continue
-        trial = normalise_trial(row, max_new, spec_min_p)
+        trial = normalise_trial(row, max_new, spec_min_p, pack)
         if trial is None:
             continue
         if trial["max_new"] != int(max_new):
             continue
         out.append(trial)
     return out
+
+
+def dedupe(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One prior per configuration, the best score winning.
+
+    Two records can normalise to the same configuration - a --kv the pack's runner ignores
+    is the run of another arm - and the study should be seeded with one of them.
+    """
+    best: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for trial in trials:
+        key = tuple(trial["signature"])
+        if key not in best or trial["score"] > best[key]["score"]:
+            best[key] = trial
+    return sorted(best.values(), key=lambda t: (-t["score"], t["signature"]))
 
 
 def merge(existing: dict[str, Any] | None, record: dict[str, Any]) -> dict[str, Any]:
@@ -231,6 +294,11 @@ def distributions_for(params: list[Param], cfg: Config) -> dict[str, Any]:
             low, high, step = int(p.low), int(p.high), int(p.step) or 1
             if not (low <= int(value) <= high):
                 raise ValueError(f"{p.key}={value!r} is outside [{low}, {high}]")
+            # Optuna rejects a value that is not on the step, so the check has to happen
+            # here: a prior that only misses the step would otherwise blow up inside
+            # create_trial and be counted as a bad prior rather than a grid mismatch.
+            if (int(value) - low) % step:
+                raise ValueError(f"{p.key}={value!r} is not on the {step}-step grid [{low}, {high}]")
             out[p.key] = _int_distribution(low, high, step)
         else:
             flo, fhi = float(p.low), float(p.high)

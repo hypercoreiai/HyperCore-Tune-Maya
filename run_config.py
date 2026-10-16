@@ -1,12 +1,17 @@
 """HyperCore-Tune-Maya/run_config.py - the sweep's winner as a run config Maya can read.
 
-Deliverables, in the project's own format (the same shape maya.py writes for a model):
+Deliverables, in the project's own format (the same shape maya.py writes for a model), and
+always under a name the sweep owns:
 
-    maya-<model>.json   a run config: the keys maya.py owns (exe, args, cwd, tokenizer,
-                           model_name, gpu, log, lib_dirs, port, host, env) with the
-                           winning engine arguments in "args"
-    run-maya-<model>.sh     the launcher: maya.py with that config
-    run-maya-<model>.bat    the same launcher for a Windows install of Maya
+    max_<model>_config.json  a run config: the keys maya.py owns (exe, args, cwd, tokenizer,
+                            model_name, gpu, log, lib_dirs, port, host, env) with the
+                            winning engine arguments in "args"
+    max_<model>_run.sh       the launcher: maya.py with that config
+    max_<model>_run.bat      the same launcher for a Windows install of Maya
+
+The model's own `maya-<model>.json` and `run-maya-<model>.sh` are never written. A sweep
+that turns out worse than the installed tune leaves it in place, so the original is always
+there as a fallback; the two are side by side and the user picks which launcher to run.
 
 Only "args" is replaced. Everything the model's existing config carries that the installer
 does not own (sampling, reasoning_effort, vision, mcp_servers, ...) is kept, so the
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +58,24 @@ SWEEP_ONLY: tuple[tuple[str, int], ...] = (
 
 # Keys a file must have to be treated as a run config rather than a tuning record.
 RUN_CONFIG_MARKERS = ("exe", "args", "cwd")
+
+# The names a sweep writes. They are deliberately different from the installed ones
+# (maya-<model>.json, run-maya-<model>.sh/.bat): the original tune is never overwritten.
+CONFIG_SUFFIX = "_config.json"
+RUN_SUFFIX = "_run.sh"
+RUN_BAT_SUFFIX = "_run.bat"
+
+
+def deliverable_names(model: str) -> tuple[str, str, str]:
+    """(config, launcher, launcher.bat) for a model, e.g. max_maya-s24_config.json.
+
+    The model name is folded to the slug the rest of the project uses: lowercase, with
+    spaces, dashes and underscores all reduced to a single dash. Only the `max_` prefix is
+    the sweep's own; everything after it is the model the user named.
+    """
+    quant = re.sub(r"[-_\s]+", "-", str(model).strip().lower()).strip("-")
+    base = f"max_{quant}"
+    return base + CONFIG_SUFFIX, base + RUN_SUFFIX, base + RUN_BAT_SUFFIX
 
 
 
@@ -114,14 +138,17 @@ def find_base_config(model: str, root: Path) -> dict[str, Any] | None:
     """The model's current run config, if there is one.
 
     Preferred order: the installed Maya config (maya-<model>.json), then a deliverable
-    from an earlier sweep. A file is only accepted when it has the run-config shape, so a
-    tuning record is never mistaken for a config.
+    from an earlier sweep (max-<model>_config.json). A file is only accepted when it has
+    the run-config shape, so a tuning record is never mistaken for a config. The installed
+    config is read first because it is the tune the user started from: a re-tune inherits
+    its keys, not the keys of the last sweep.
     """
     quant = model.lower()
     names = [f"maya-{quant}.json"]
     if not quant.startswith("maya-"):
         names.append(f"maya-maya-{quant}.json")
     names.append(f"strata-{quant}.json")
+    names.append(deliverable_names(quant)[0])
     for name in names:
         path = root / name
         if not path.is_file():
@@ -155,7 +182,9 @@ def build_run_config(
     # exe is only used when the record has none.
     engine = record.get("engine") or cfg.get("exe") or engine_binary(root)
     cfg["exe"] = str(abs_path(engine) or Path(engine).expanduser().resolve())
-    cfg["cwd"] = cfg.get("cwd") or str(root)
+    # A base config written by hand or by an older release may hold a relative cwd; the
+    # launcher runs from wherever the user clicks it, so it has to be absolute.
+    cfg["cwd"] = str(abs_path(cfg.get("cwd")) or root)
     cfg["args"] = clean_args(args)
 
     tokenizer = cfg.get("tokenizer") or paths.get("tokenizer") or ""
@@ -216,6 +245,11 @@ def build_run_config(
         # history | dry_run | study: who produced the winning numbers.
         "source": record.get("source", "study"),
         "metrics": record.get("metrics", {}),
+        # How the winning numbers were produced. A tok/s is only meaningful next to the
+        # prompt, context and binary it came from; without this a user comparing the
+        # launcher's numbers with a live run has no way to see why they differ.
+        "conditions": record.get("conditions", {}),
+        "prior_best": record.get("prior_best"),
         "study": record.get("study", {}),
         "history": record.get("history", {}),
         "csv": record.get("csv"),
@@ -274,7 +308,7 @@ def launcher_text(
     serve = serve_command(cfg_path, engine, port, open_browser, root)
     lines = ["#!/bin/sh"]
     lines += [f"# {line}" for line in note]
-    lines.append(f'cd "{str(root)}"')
+    lines.append(f'cd "{root!s}"')
     lines.append("exec " + " ".join(f'"{x}"' for x in serve))
     return "\n".join(lines) + "\n"
 
@@ -311,27 +345,41 @@ def _emit_pair(
     root = maya_root()
     base = find_base_config(quant, root)
     cfg = build_run_config(quant, paths, args, record, base=base, port=port)
-    js = _write_json(deliverable_dir / f"maya-{quant}.json", cfg)
+    config_name, run_name, bat_name = deliverable_names(quant)
+    js = _write_json(deliverable_dir / config_name, cfg)
 
+    installed = next((p for p in (root / f"run-maya-{quant}.sh", root / f"run-{quant}.sh")
+                     if p.is_file()), None)
+    cond = cfg["tuned_by"].get("conditions", {})
     note = (
-        (f"run-maya-{quant}.sh - generated {cfg['tuned_by']['generated_utc']} "
+        (f"{run_name} - generated {cfg['tuned_by']['generated_utc']} "
          f"by HyperCore-Tune-Maya/max_tune.sh"),
         (f"Bayesian (Optuna TPE) winner for the {cfg['tuned_by']['objective']} objective "
          f"at --max-context {cfg['tuned_by']['context']}"),
-        (f"gen {cfg['tuned_by']['metrics'].get('gen_tok_s', 0):.2f} tok/s, "
+        (f"decode {cfg['tuned_by']['metrics'].get('decode_tok_s', 0):.2f} tok/s, "
          f"prefill {cfg['tuned_by']['metrics'].get('prefill_tok_s', 0):.2f} tok/s, "
-         f"latency {cfg['tuned_by']['metrics'].get('latency_ms', 0):.1f} ms"),
+         f"latency {cfg['tuned_by']['metrics'].get('latency_ms', 0):.1f} ms"
+         + (f", thinking {cfg['tuned_by']['metrics'].get('thinking_tok_s', 0):.2f} tok/s"
+            if cfg['tuned_by']['metrics'].get('thinking_tok_s') else "")),
+        ((f"measured here: {cond.get('prompt_tokens', 0)} prompt tokens, "
+         f"--max-new {cond.get('max_new', 0)}, engine {cond.get('engine', 'unknown')}"
+         + (f", thinking budget {cond['think_budget']} tokens"
+            if cond.get("think_budget") else ""))
+         if cond else "measured on this machine"),
         f"tuned on {cfg['tuned_by'].get('hardware_slug', 'unknown machine')}",
         (f"the trial record is "
          f"{REPO / 'results' / f'maya-{quant}.record.json'}"),
+        (f"the installed launcher {installed.name} is untouched - run this one only if the "
+         "tuned configuration beats it" if installed is not None else
+         "no installed launcher was found, so this is the only one"),
     )
     engine_name = server_engine_name(root)
-    sh = deliverable_dir / f"run-maya-{quant}.sh"
+    sh = deliverable_dir / run_name
     # "--engine" is only passed to a checkout whose entry point has that selector; the
     # binary the worker runs is the "exe" key in the config beside the script.
     sh.write_text(launcher_text(js, engine_name, cfg["port"], open_browser, note), encoding="utf-8")
     sh.chmod(0o755)
-    bat = deliverable_dir / f"run-maya-{quant}.bat"
+    bat = deliverable_dir / bat_name
     bat.write_text(launcher_bat(js, engine_name, cfg["port"], open_browser, note), encoding="utf-8")
     return js, sh
 

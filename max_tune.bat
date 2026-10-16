@@ -1,15 +1,28 @@
 @echo off
 rem HyperCore-Tune-Maya\max_tune.bat - Windows 10/11 entry point for the Bayesian (Optuna) sweep.
 rem
-rem   max_tune.bat --model maya-s24 --gen      --cntx 131072
+rem   max_tune.bat --model maya-s24 --decode   --cntx 131072
 rem   max_tune.bat --model maya-s24 --prefill  --cntx 131072 --trials 60
+rem   max_tune.bat --model maya-s24 --think    --think-budget 512 --max-new 1024
 rem   max_tune.bat --model maya-s24 --latency  --mode staged --dry-run
+rem   max_tune.bat --model maya-s24 --balance  --cntx 131072
+rem
+rem Objectives: --decode maximises decode tokens/s (--gen is its alias), --think
+rem maximises thinking tokens/s (needs --think-budget N), --prefill maximises prompt
+rem tokens/s, --latency minimises prompt_ms + decode_ms, and --balance maximises decode
+rem tokens/s discounted by the share of a token the engine spent on the SSD and CPU lane.
 rem   max_tune.bat --show-project
 rem   max_tune.bat --install
 rem
-rem Dimensions: vram pcie pcie-mode ple-io kv kvstream hostworker worker tail draft-floor
-rem Freeze any of them with the matching flag (--pcie, --kv, --draft-floor, ...).
+rem Dimensions: vram pcie pcie-mode ple-io ple-inflight kv kvstream hostworker worker tail
+rem               draft-floor suffix-draft mtp-max-t parallel
+rem Freeze any of them with the matching flag (--pcie, --kv, --draft-floor, --parallel, ...).
+rem --kv is limited to what the pack runner implements (int8/fp16 for --glm-pack);
+rem --parallel is a GLM-pack dimension, suffix-draft/mtp-max-t only when no --dflash was found.
 rem --trials counts unseen configurations; repeats in history are redrawn.
+rem The sweep checks free VRAM against the pack dense pool before the first trial and stops
+rem if the card cannot host it. --no-preflight skips that check.
+rem --cntx sets the context the sweep is tuned at; default 32768.
 rem --tail is --prompt-cache: the conversation checkpoints the engine keeps.
 rem
 rem This app is standalone. It talks to a Maya checkout found from this folder's

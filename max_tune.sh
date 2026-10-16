@@ -2,33 +2,54 @@
 #
 # HyperCore-Tune-Maya/max_tune.sh - entry point for the Bayesian (Optuna) sweep.
 #
-#   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --gen      --cntx 131072
+#   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --decode   --cntx 131072
 #   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --prefill  --cntx 131072 --trials 60
 #   ./HyperCore-Tune-Maya/max_tune.sh --model maya-s24 --latency  --mode staged --dry-run
 #   ./HyperCore-Tune-Maya/max_tune.sh --show-project           # print the resolved paths, then exit
 #   ./HyperCore-Tune-Maya/max_tune.sh --install               # put optuna into the project venv, then exit
 #
-# The objective is one of three user-selected metrics:
-#   --gen      maximise generation tokens/s
-#   --prefill  maximise prompt tokens/s
-#   --latency  minimise prompt_ms + decode_ms
+# The objective is one of five user-selected metrics:
+#   --decode     maximise decode tokens/s (every token the request generates; --gen is its alias)
+#   --think      maximise thinking tokens/s, the reasoning block alone; needs --think-budget N
+#   --prefill    maximise prompt tokens/s
+#   --latency    minimise prompt_ms + decode_ms
+#   --balance    maximise decode tokens/s discounted by the share of a token the engine spent
+#                on the SSD and the CPU lane (its glm stat line): fast AND resident
+#   --think-budget N   tokens the request may reason before answering (GEN key think_budget)
+#   --think-end N      the pack's think-end token id, 151667 by default
+#
+#   --cntx N   the context the sweep is tuned at; default 32768 (--context is the alias)
 #
 # The dimensions searched are the columns every row is written with:
-#   layer  vram  pcie  pcie_mode  ple_io  kv  kvstream  hostworker  worker  tail  draft-floor  status
+#   layer  vram  pcie  pcie_mode  ple_io  ple_inflight  kv  kvstream  hostworker  worker
+#          tail  draft_floor  suffix_draft  mtp_max_t  parallel  status
 #
 # Hold a dimension constant instead of searching it:
-#   --pcie --pcie-mode --ple-io --kv --kvstream --hostworker --worker --tail --draft-floor
+#   --pcie --pcie-mode --ple-io --ple-inflight --kv --kvstream --hostworker --worker
+#   --tail --draft-floor --suffix-draft --mtp-max-t --parallel
 # --draft-floor is --spec-min-p on the engine, searched in [0.001, 1] unless pinned.
 # --tail is --prompt-cache: the conversation checkpoints the engine keeps between requests.
+# --kv is limited to the modes the pack's runner implements: int8/fp16 for a --glm-pack,
+#   all four for a qwen pack. --parallel is the GLM runner's sequence-state count (1-8).
+# --suffix-draft and --mtp-max-t are only searched when no --dflash drafter was found:
+#   with one, the request decodes through decode_dflash and the MTP path is never reached.
 #
 # --trials is unseen configurations: a repeat of a point already in history is redrawn
 # and does not count.
 #
+# The sweep checks the free VRAM against the pack's dense pool before the first trial and
+# stops if the card cannot host it (--no-preflight to skip). Three configurations in a row
+# failing the same way also stop it: an unmeasured trial scores the same as a zero, so a
+# busy GPU reads to the sampler as a flat landscape.
+#
 # Deliverables, at the Maya project root, in the project's own run-config format:
-#   run-maya-<model>.sh / .bat   the startup script: serve/server.py with the winning config
-#   maya-<model>.json        that run config, with the winning engine arguments in "args"
+#   max_<model>_run.sh / .bat  the startup script: serve/server.py with the winning config
+#   max_<model>_config.json    that run config, with the winning engine arguments in "args"
 #   HyperCore-Tune-Maya/results/maya-<model>.record.json   every trial and its metrics
 #   HyperCore-Tune-Maya/results/bayesian-<machine>-<model>-<objective>-<stamp>.csv
+#
+# The model's own run-maya-<model>.sh and maya-<model>.json are never written: the tune it
+# shipped with stays in place as a fallback next to the new one.
 #
 # Run data is kept per machine in HyperCore-Tune-Maya/history/, named
 #   <CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
@@ -159,7 +180,7 @@ fi
 
 if ! "$PY" -c "import optuna" >/dev/null 2>&1; then
     echo "max_tune.sh: $PY cannot import optuna. Install it:" >&2
-    echo "    $PY -m pip install -r HyperCore-Tune-Maya/requirements.txt" >&2
+    echo "    $PY -m pip install -r "$HERE/requirements.txt"" >&2
     echo "  or run: ./HyperCore-Tune-Maya/max_tune.sh --install" >&2
     exit 1
 fi

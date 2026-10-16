@@ -2,11 +2,12 @@
 """HyperCore-Tune-Maya/bayesian_tune.py - Bayesian (TPE) tuning of the Project Maya engine.
 
 Searches the dimensions the GLM engine exposes - vram, pcie, pcie-mode, ple-io, kv,
-kv-streaming, host-worker, pool workers, prompt-cache, draft-floor - against one of three
+kv-streaming, host-worker, pool workers, prompt-cache, draft-floor - against one of four
 user-selected objectives:
 
+    --decode    maximise decode tokens/s (the generated-token rate; --gen is its alias)
+    --think     maximise thinking tokens/s, the reasoning block alone
     --prefill   maximise prompt tokens/s
-    --gen       maximise generated tokens/s
     --latency   minimise prompt_ms + decode_ms for the request
 
 Two search modes:
@@ -17,8 +18,11 @@ Two search modes:
 
 Deliverables, written at the Maya project root as requested:
 
-    run-maya-<model>.sh     the production launcher for the winning configuration
-    maya-<model>.json   the winning configuration, its metrics, and every trial
+    max_<model>_run.sh      the tuned launcher for the winning configuration
+    max_<model>_config.json the winning configuration, its metrics, and every trial
+
+The installed `run-maya-<model>.sh` and `maya-<model>.json` are never touched, so the tune
+the model shipped with is always there as a fallback.
 
 Run data from previous sweeps is kept in HyperCore-Tune-Maya/history/, one file per machine,
 model, objective and context:
@@ -58,29 +62,56 @@ except ImportError:  # GPSampler needs scipy; it is optional here.
     GPSampler = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from engine_runner import Metrics, build_prompt, run_config
-from hardware import Hardware, fingerprint, hardware_from
+from engine_runner import (
+    THINK_BUDGET_KEY,
+    THINK_END_KEY,
+    EngineSession,
+    Metrics,
+    build_prompt,
+    run_config,
+    vocab_size,
+)
+from hardware import Hardware, ambient_state, fingerprint, free_vram_mib, hardware_from
+from history import dedupe as dedupe_priors
 from history import distributions_for, find_history, history_path, usable_trials
 from history import load as load_history
 from history import save as save_history
+from maya_env import abs_path, engine_binary, maya_root
 from run_config import write_deliverables as write_run_pair
 from search_space import (
+    DEFAULT_CONFIG,
     LAYERS,
+    REQUEST_DIMS,
     ROW_COLUMNS,
     Config,
     ModelPaths,
     Param,
     build_space,
     engine_args,
+    kv_modes_for,
+    pack_kind,
+    pack_vram_floor_mib,
     physical_cores,
+    quasi_random_configs,
+    request_keys,
     resolve_model_paths,
     sample,
     signature,
+    topology_signature,
 )
-from maya_env import abs_path, engine_binary, maya_root
+from transfer import TRANSFER_COLUMNS, balance_score, expert_blob_bytes, frontier
 
-OBJECTIVES = ("gen", "prefill", "latency")
-PENALTY = {"gen": 0.0, "prefill": 0.0, "latency": -1e9}  # every score is "higher is better"
+OBJECTIVES = ("decode", "think", "prefill", "latency", "balance")
+# The metric name older records and CSVs use. A sweep reads them, writes only the new one.
+LEGACY_OBJECTIVE = {"gen": "decode"}
+# Every score is "higher is better": a configuration that cannot boot scores PENALTY, the
+# same 0.0 as a real zero throughput.
+PENALTY = {objective: 0.0 for objective in OBJECTIVES}
+PENALTY["latency"] = -1e9
+# A configuration that cannot boot scores PENALTY, the same 0.0 as a real zero throughput.
+# When the same failure repeats, it is the machine, not the search: stop and say so rather
+# than spend the remaining trials on identical zeros.
+FAIL_STREAK = 3
 
 
 def utc_stamp() -> str:
@@ -101,13 +132,24 @@ def run_log_name(results_dir: Path, layer: str, cfg: Config, index: int) -> Path
 
 
 def signed_score(m: Metrics, objective: str) -> float:
-    """One number to maximise. Failed boots score at the bottom of the range."""
+    """One number to maximise. Failed boots score at the bottom of the range.
+
+    `balance` is the decode rate discounted by the share of a token the engine spent off the
+    card (SSD reads plus the CPU lane), read from its own `glm stat` line. A configuration
+    that wins on raw tok/s while half its token time is bus waiting scores below one that is
+    a little slower and already resident. With no telemetry the discount is zero, so a stub
+    engine or an older build behaves exactly like --decode.
+    """
     if not m.ok():
         return PENALTY[objective]
-    if objective == "gen":
-        return m.gen_tok_s
+    if objective == "decode":
+        return m.decode_tok_s
+    if objective == "think":
+        return m.thinking_tok_s
     if objective == "prefill":
         return m.prefill_tok_s
+    if objective == "balance":
+        return balance_score(m.decode_tok_s, m.transfer)
     return -m.latency_ms
 
 
@@ -137,6 +179,14 @@ def frozen_from_args(args: argparse.Namespace) -> dict[str, object]:
         frozen["tail"] = str(args.tail)
     if getattr(args, "draft_floor", None) is not None:
         frozen["draft_floor"] = float(args.draft_floor)
+    if getattr(args, "ple_inflight", None) is not None:
+        frozen["ple_inflight"] = int(args.ple_inflight)
+    if getattr(args, "suffix_draft", None) is not None:
+        frozen["suffix_draft"] = int(args.suffix_draft)
+    if getattr(args, "mtp_max_t", None) is not None:
+        frozen["mtp_max_t"] = int(args.mtp_max_t)
+    if getattr(args, "parallel", None) is not None:
+        frozen["parallel"] = int(args.parallel)
     return frozen
 
 
@@ -165,34 +215,38 @@ class TrialRow:
     metrics: Metrics
     score: float
     from_history: bool = False
+    # The engine binary that produced the numbers. A prior measured by a different
+    # engine - the test stub, an older build - is not comparable to this sweep and is
+    # never allowed to become the winner.
+    engine: str = ""
 
     def csv_row(self) -> dict[str, object]:
         m = self.metrics
-        row: dict[str, object] = {
-            "layer": self.layer,
-            "vram": self.cfg["vram"],
-            "pcie": self.cfg["pcie"],
-            "ple_io": self.cfg["ple_io"],
-            "kv": self.cfg["kv"],
-            "kvstream": self.cfg["kvstream"],
-            "hostworker": self.cfg["hostworker"],
-            "pcie_mode": self.cfg["pcie_mode"],
-            "worker": self.cfg["worker"],
-            "tail": self.cfg["tail"],
-            "draft_floor": self.cfg["draft_floor"],
-            "status": m.status,
-        }
+        # Every engine column comes from the configuration; a dimension this pack's runner
+        # does not have is written empty rather than guessed, so a row never claims an arm
+        # the engine was never given.
+        row: dict[str, object] = {"layer": self.layer}
+        for column in ROW_COLUMNS[1:-1]:
+            row[column] = self.cfg.get(column, "")
+        row["status"] = m.status
         row.update({
-            "gen_tok_s": f"{m.gen_tok_s:.2f}",
+            "decode_tok_s": f"{m.decode_tok_s:.2f}",
+            "thinking_tok_s": f"{m.thinking_tok_s:.2f}",
+            "answer_tok_s": f"{m.answer_tok_s:.2f}",
             "prefill_tok_s": f"{m.prefill_tok_s:.2f}",
             "latency_ms": f"{m.latency_ms:.1f}",
             "prompt_ms": f"{m.prompt_ms:.1f}",
             "decode_ms": f"{m.decode_ms:.1f}",
+            "think_ms": f"{m.think_ms:.1f}",
+            "answer_ms": f"{m.answer_ms:.1f}",
             "generated": m.generated,
             "prompt_tokens": m.prompt_tokens,
             "score": f"{self.score:.4f}",
             "note": m.note,
         })
+        if m.transfer:
+            row.update({key: value for key, value in m.transfer.items() if key != "flags"})
+            row["flags"] = "|".join(m.transfer.get("flags", []))
         return row
 
     def to_dict(self) -> dict[str, Any]:
@@ -200,8 +254,17 @@ class TrialRow:
         row = self.csv_row()
         row["cfg"] = dict(self.cfg)
         row["signature"] = list(signature(self.cfg))
+        row["ambient"] = self.metrics.ambient
+        if self.metrics.transfer:
+            row["transfer"] = dict(self.metrics.transfer)
         row["from_history"] = self.from_history
+        row["engine"] = self.engine
         return row
+
+
+# One line per unseedable prior is noise when a history predates a new dimension; the
+# count is what matters, so the detail stops after a handful.
+_SEED_NOTE_LIMIT = 5
 
 
 class Sweeper:
@@ -215,39 +278,125 @@ class Sweeper:
         self.paths = paths
         self.hw = hw
         self.priors = priors
+        # One expert blob, from the pack's own index, so reads/tok can be stated in bytes/s.
+        self.blob_bytes = expert_blob_bytes(self.paths.pack) if self.paths.pack else None
+        self.priors_loaded = len(priors)
         self.rows: list[TrialRow] = []
         self.seen: set[tuple[object, ...]] = set()
         self.prior_rows: dict[tuple[object, ...], TrialRow] = {}
+        # best_row: the best configuration this run measured. incumbent: the best prior
+        # carried in from history. Only a measured configuration can be the winner; a
+        # prior is a seed for the sampler and a number to compare against, nothing more.
         self.best_row: TrialRow | None = None
+        self.incumbent: TrialRow | None = None
         self.priors_skipped = 0
+        self.priors_merged = 0
+        self.seed_notes = 0
         self.duplicates_skipped = 0
+        self.fail_streak = 0
+        self.last_failure = ""
         self.frozen: dict[str, object] = dict(getattr(args, "frozen", {}) or {})
+        # The prompt is built before the priors are filtered: a prior measured on a
+        # different prompt is not a number this run could reproduce.
+        self.prompt_ids = build_prompt(
+            args.prompt_tokens_file,
+            args.prompt_tokens,
+            tokenizer_dir=self.paths.tokenizer or None,
+            root=str(self.root),
+            vocab=vocab_size(self.paths.tokenizer, self.paths.pack),
+        )
         if self.frozen:
             self.priors = [p for p in priors if _cfg_matches_frozen(p.get("cfg", {}), self.frozen)]
-        self.prompt_ids = build_prompt(args.prompt_tokens_file, args.prompt_tokens)
+        self.priors = self._usable_priors(self.priors)
         self.model = args.model.lower()
+        self.session: EngineSession | None = None
+        self.session_topology: tuple[str, ...] | None = None
         self._seed_from_history()
 
+    def _usable_priors(self, priors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The priors this run's grid can hold, one per configuration.
+
+        A prior outside the bounds asked for (--vram-max, --max-workers) cannot seed the
+        study, and keeping it as the incumbent best would put a value the engine would
+        reject - or a flag this pack's runner ignores - into the generated launcher.
+        A prior measured by a different engine, or with a different prompt, is dropped for
+        the same reason: its tok/s is not a number this sweep could reproduce, and a
+        winner taken from it would be a number the user cannot check.
+        Two records that normalise to the same configuration are folded into the better one.
+        """
+        kept: list[dict[str, Any]] = []
+        engine = str(self.args.engine)
+        prompt_tokens = len(self.prompt_ids)
+        for prior in priors:
+            try:
+                distributions_for(self.params, prior.get("cfg", {}))
+            except ValueError as exc:
+                self.priors_skipped += 1
+                self._seed_note(prior.get("cfg", {}), exc)
+                continue
+            recorded_engine = str(prior.get("engine", "") or "")
+            if recorded_engine and recorded_engine != engine:
+                self.priors_skipped += 1
+                self._seed_note(prior.get("cfg", {}),
+                                f"measured with a different engine ({recorded_engine})")
+                continue
+            recorded_prompt = int(prior.get("prompt_tokens", 0) or 0)
+            if recorded_prompt and recorded_prompt != prompt_tokens:
+                self.priors_skipped += 1
+                self._seed_note(prior.get("cfg", {}),
+                                f"measured on a {recorded_prompt}-token prompt, this run "
+                                f"uses {prompt_tokens}")
+                continue
+            kept.append(prior)
+        deduped = dedupe_priors(kept)
+        self.priors_merged = len(kept) - len(deduped)
+        return deduped
+
     def _seed_from_history(self) -> None:
-        """Turn every prior measured on this machine into a row that never needs a boot."""
+        """Turn every prior measured on this machine into a row that never needs a boot.
+
+        Priors are seeds: they warm the sampler and they are the number the sweep is trying
+        to beat. They are not the winner - the launcher a sweep writes out has to be a
+        configuration this run actually measured on this machine.
+        """
         for prior in self.priors:
             stored = prior["metrics"]
             metrics = Metrics(status="CACHED")
-            metrics.gen_tok_s = float(stored.get("gen_tok_s", 0.0) or 0.0)
+            metrics.decode_tok_s = float(stored.get("decode_tok_s", stored.get("gen_tok_s", 0.0)) or 0.0)
+            metrics.thinking_tok_s = float(stored.get("thinking_tok_s", 0.0) or 0.0)
+            metrics.answer_tok_s = float(stored.get("answer_tok_s", 0.0) or 0.0)
             metrics.prefill_tok_s = float(stored.get("prefill_tok_s", 0.0) or 0.0)
             metrics.latency_ms = float(stored.get("latency_ms", 0.0) or 0.0)
             metrics.prompt_ms = float(stored.get("prompt_ms", 0.0) or 0.0)
             metrics.decode_ms = float(stored.get("decode_ms", 0.0) or 0.0)
+            metrics.think_ms = float(stored.get("think_ms", 0.0) or 0.0)
+            metrics.answer_ms = float(stored.get("answer_ms", 0.0) or 0.0)
             metrics.generated = int(stored.get("generated", 0) or 0)
             metrics.prompt_tokens = int(stored.get("prompt_tokens", 0) or 0)
             row = TrialRow(layer="history", cfg=dict(prior["cfg"]),
                           metrics=metrics, score=float(prior["score"]),
-                          from_history=True)
+                          from_history=True, engine=str(prior.get("engine", "")))
             sig = tuple(prior["signature"])
             self.seen.add(sig)
             self.prior_rows[sig] = row
-            if self.best_row is None or row.score > self.best_row.score:
-                self.best_row = row
+            if self.incumbent is None or row.score > self.incumbent.score:
+                self.incumbent = row
+
+    def winner(self) -> TrialRow | None:
+        """The configuration to hand to the launcher: measured here, else the incumbent.
+
+        A prior is only used when nothing in this run produced tokens (a dry run, a busy
+        GPU); record() labels that case source="history" so it is never read as a new
+        measurement.
+        """
+        return self.best_row or self.incumbent
+
+    def _close_session(self) -> None:
+        """Close the shared engine session, if one is open."""
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+            self.session_topology = None
 
     # ---- one configuration ----------------------------------------------------
     def evaluate(self, layer: str, cfg: Config) -> TrialRow:
@@ -261,53 +410,111 @@ class Sweeper:
                               PENALTY[self.args.objective])
             else:
                 row = TrialRow(layer, cfg, prior.metrics, prior.score,
-                              from_history=prior.from_history)
+                              from_history=prior.from_history, engine=prior.engine)
             self.rows.append(row)
-            if self.best_row is None or row.score > self.best_row.score:
+            # A prior reused from history is not a new measurement: it cannot take the
+            # title. Only a configuration this run booted can.
+            if not row.from_history and (self.best_row is None or row.score > self.best_row.score):
                 self.best_row = row
             return row
         self.seen.add(sig)
 
-        args = engine_args(cfg, self.paths.as_dict(), self.args.cntx,
-                           self.args.max_new, draft_floor_of(self.args))
         if self.args.dry_run:
+            args = engine_args(cfg, self.paths.as_dict(), self.args.cntx,
+                              self.args.max_new, draft_floor_of(self.args))
             m = Metrics(status="DRY")
             m.note = " ".join(args)
             row = TrialRow(layer, cfg, m, PENALTY[self.args.objective])
             self.rows.append(row)
-            if self.best_row is None:
+            # A dry run has no measurement to win with. It falls back to the incumbent
+            # prior when there is one, and only holds the command line as the best when
+            # nothing has ever been measured on this machine.
+            if self.best_row is None and self.incumbent is None:
                 self.best_row = row
             return row
 
+        ambient = ambient_state()
+        ambient["captured_utc"] = utc_stamp()
+        boot_args = engine_args(cfg, self.paths.as_dict(), self.args.cntx,
+                                self.args.max_new, draft_floor_of(self.args),
+                                request_keys=bool(self.args.two_stage))
+        keys = request_keys(cfg) if self.args.two_stage else {}
+        if self.args.think_budget > 0:
+            keys[THINK_BUDGET_KEY] = self.args.think_budget
+            keys[THINK_END_KEY] = self.args.think_end
+        top_sig = topology_signature(cfg, self.params) if self.args.two_stage else None
         runs: list[Metrics] = []
-        for i in range(self.args.repeat):
-            log = self.args.results_dir / run_log_name(self.args.results_dir, layer, cfg, i)
-            runs.append(run_config(
-                engine=self.args.engine, args=args, prompt_ids=self.prompt_ids,
-                max_new=self.args.max_new, log_path=log,
-                boot_timeout=self.args.boot_timeout, run_timeout=self.args.run_timeout,
-                cwd=self.root,
-            ))
+
+        if self.args.two_stage:
+            if not self.session or not self.session.alive() or self.session_topology != top_sig:
+                self._close_session()
+                log = self.args.results_dir / run_log_name(self.args.results_dir, layer, cfg, 0)
+                self.session = EngineSession(
+                    engine=self.args.engine, args=boot_args, log_path=log,
+                    boot_timeout=self.args.boot_timeout, run_timeout=self.args.run_timeout,
+                    cwd=self.root, blob_bytes=self.blob_bytes,
+                )
+                self.session_topology = top_sig
+            for _ in range(self.args.repeat):
+                if not self.session or not self.session.alive():
+                    self._close_session()
+                    log = self.args.results_dir / run_log_name(self.args.results_dir, layer, cfg, 0)
+                    self.session = EngineSession(
+                        engine=self.args.engine, args=boot_args, log_path=log,
+                        boot_timeout=self.args.boot_timeout, run_timeout=self.args.run_timeout,
+                        cwd=self.root, blob_bytes=self.blob_bytes,
+                    )
+                    self.session_topology = top_sig
+                runs.append(self.session.request(self.prompt_ids, self.args.max_new, keys))
+        else:
+            for i in range(self.args.repeat):
+                log = self.args.results_dir / run_log_name(self.args.results_dir, layer, cfg, i)
+                runs.append(run_config(
+                    engine=self.args.engine, args=boot_args, prompt_ids=self.prompt_ids,
+                    max_new=self.args.max_new, log_path=log,
+                    boot_timeout=self.args.boot_timeout, run_timeout=self.args.run_timeout,
+                    cwd=self.root, request_keys=keys, blob_bytes=self.blob_bytes,
+                ))
         # Median of the repeats: one boot is noisy enough to flip a ranking.
         best = max(runs, key=lambda m: signed_score(m, self.args.objective))
+        best.ambient = ambient
         if self.args.repeat > 1 and best.ok():
-            best.gen_tok_s = statistics.median(r.gen_tok_s for r in runs if r.ok())
-            best.prefill_tok_s = statistics.median(r.prefill_tok_s for r in runs if r.ok())
-            best.latency_ms = statistics.median(r.latency_ms for r in runs if r.ok())
+            for field_name in ("decode_tok_s", "thinking_tok_s", "answer_tok_s",
+                              "prefill_tok_s", "latency_ms"):
+                setattr(best, field_name, statistics.median(
+                    getattr(r, field_name) for r in runs if r.ok()))
+            # The bus figures move from token to token more than the rate does, so they are
+            # averaged over the repeats rather than taken from whichever boot scored best.
+            transfer_rows = [r.transfer for r in runs if r.transfer]
+            if transfer_rows:
+                for key in ("off_card_ms_per_tok", "transfer_share", "disk_reads_per_tok",
+                            "disk_ms_per_tok", "ram_fetches_per_tok", "vram_hit_pct"):
+                    values = [float(row.get(key, 0.0)) for row in transfer_rows]
+                    best.transfer[key] = round(statistics.median(values), 4)
 
-        row = TrialRow(layer, cfg, best, signed_score(best, self.args.objective))
+        if not best.ok():
+            note = best.note or "the engine exited with no message"
+            if note == self.last_failure:
+                self.fail_streak += 1
+            else:
+                self.last_failure, self.fail_streak = note, 1
+        else:
+            self.last_failure, self.fail_streak = "", 0
+
+        row = TrialRow(layer, cfg, best, signed_score(best, self.args.objective),
+                      engine=str(self.args.engine))
         self.rows.append(row)
         if self.best_row is None or row.score > self.best_row.score:
             self.best_row = row
         m = row.metrics
-        print(f"  trial {len(self.rows):>3} layer={layer} "
-              f"vram={cfg['vram']} pcie={cfg['pcie']} ple-io={cfg['ple_io']} kv={cfg['kv']} "
-              f"kvstream={cfg['kvstream']} hostworker={cfg['hostworker']} "
-              f"pcie_mode={cfg['pcie_mode']} "
-              f"worker={cfg['worker']} tail={cfg['tail']} "
-              f"draft-floor={cfg['draft_floor']} -> {m.status} "
-              f"gen {m.gen_tok_s:.2f} tok/s prefill {m.prefill_tok_s:.2f} tok/s "
-              f"latency {m.latency_ms:.0f} ms" + (f"  [{m.note}]" if m.note else ""))
+        dims = " ".join(f"{k}={cfg[k]}" for k in ROW_COLUMNS[1:-1] if k in cfg)
+        bus = (f" bus {m.transfer['transfer_share']:.0%} off-card" if m.transfer else "")
+        print(f"  trial {len(self.rows):>3} layer={layer} {dims} -> {m.status} "
+              f"decode {m.decode_tok_s:.2f} tok/s prefill {m.prefill_tok_s:.2f} tok/s "
+              f"latency {m.latency_ms:.0f} ms"
+              + (f" thinking {m.thinking_tok_s:.2f} tok/s" if m.thinking else "")
+              + bus
+              + (f"  [{m.note}]" if m.note else ""))
         sys.stdout.flush()
         return row
 
@@ -317,32 +524,35 @@ class Sweeper:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         sampler = make_sampler(self.args.sampler, self.args.seed)
 
-        if self.args.mode == "joint":
-            study = optuna.create_study(direction="maximize", sampler=sampler)
-            self._warm_study(study, self.params)
-            interrupted = self._run_study(study, self.params, dict(self.frozen), self.args.trials)
-            if interrupted:
-                print("\ninterrupted: keeping the best configuration measured so far")
-            return interrupted
+        try:
+            if self.args.mode == "joint":
+                study = optuna.create_study(direction="maximize", sampler=sampler)
+                self._warm_study(study, self.params)
+                interrupted = self._run_study(study, self.params, dict(self.frozen), self.args.trials)
+                if interrupted:
+                    print("\ninterrupted: keeping the best configuration measured so far")
+                return interrupted
 
-        frozen: dict[str, object] = dict(self.frozen)
-        for layer in self.layers():
-            layer_params = [p for p in self.params if p.layer == layer]
-            if not layer_params:
-                continue
-            study = optuna.create_study(direction="maximize",
-                                      sampler=make_sampler(self.args.sampler, self.args.seed))
-            self._warm_study(study, layer_params)
-            interrupted = self._run_study(
-                study, layer_params, frozen, self.args.trials_per_layer, layer_hint=layer)
-            if interrupted:
-                print(f"\ninterrupted during layer {layer}; keeping what has been measured")
-                return True
-            if study.best_trial is not None and study.best_trial.value > PENALTY[self.args.objective]:
-                for p in layer_params:
-                    frozen[p.key] = study.best_trial.params[p.key]
-                print(f"--- layer {layer}: locked {frozen} at {study.best_trial.value:.4f}")
-        return False
+            frozen: dict[str, object] = dict(self.frozen)
+            for layer in self.layers():
+                layer_params = [p for p in self.params if p.layer == layer]
+                if not layer_params:
+                    continue
+                study = optuna.create_study(direction="maximize",
+                                          sampler=make_sampler(self.args.sampler, self.args.seed))
+                self._warm_study(study, layer_params)
+                interrupted = self._run_study(
+                    study, layer_params, frozen, self.args.trials_per_layer, layer_hint=layer)
+                if interrupted:
+                    print(f"\ninterrupted during layer {layer}; keeping what has been measured")
+                    return True
+                if study.best_trial is not None and study.best_trial.value > PENALTY[self.args.objective]:
+                    for p in layer_params:
+                        frozen[p.key] = study.best_trial.params[p.key]
+                    print(f"--- layer {layer}: locked {frozen} at {study.best_trial.value:.4f}")
+            return False
+        finally:
+            self._close_session()
 
     def _run_study(
         self,
@@ -361,7 +571,13 @@ class Sweeper:
         new = 0
         asks = 0
         streak = 0
+        stopped_on_failures = False
         max_asks = max(n_trials * 50, n_trials + 32)
+        if self.args.quasi_trials and n_trials:
+            quasi = quasi_random_configs(params, min(self.args.quasi_trials, n_trials), self.args.seed)
+            quasi.sort(key=lambda cfg: topology_signature({**DEFAULT_CONFIG, **cfg}, params))
+            for cfg in quasi:
+                study.enqueue_trial({p.key: cfg[p.key] for p in params if p.key in cfg})
         try:
             while new < n_trials and asks < max_asks:
                 trial = study.ask()
@@ -380,8 +596,17 @@ class Sweeper:
                 streak = 0
                 study.tell(trial, self._score_cfg(cfg, params, layer_hint))
                 new += 1
+                if self.fail_streak >= FAIL_STREAK:
+                    stopped_on_failures = True
+                    print(f"note: {self.fail_streak} configurations in a row failed the same "
+                          f"way ({self.last_failure}); that is the machine, not the search - "
+                          f"stopping with {new} of {n_trials} trials",
+                          file=sys.stderr)
+                    break
         except KeyboardInterrupt:
             return True
+        if stopped_on_failures:
+            return False
         if new < n_trials and streak < 32:
             print(f"note: reached the redraw limit with {new} of {n_trials} new trials "
                   f"({self.duplicates_skipped} duplicate suggestions skipped)",
@@ -393,10 +618,10 @@ class Sweeper:
         if layer_hint:
             layer = layer_hint
         else:
-            incumbent = self.best_row.cfg if self.best_row else {}
+            incumbent = self.winner().cfg if self.winner() else {}
             changed = sorted({p.layer for p in params
                              if p.key in cfg and cfg[p.key] != incumbent.get(p.key, cfg[p.key])})
-            layer = "joint" if not self.best_row else (",".join(changed) or "joint")
+            layer = "joint" if not self.winner() else (",".join(changed) or "joint")
         return self.evaluate(layer, cfg).score
 
     def expected_trials(self) -> int:
@@ -419,8 +644,9 @@ class Sweeper:
         for prior in self.priors:
             try:
                 dists = distributions_for(params, prior["cfg"])
-            except ValueError:
+            except ValueError as exc:
                 self.priors_skipped += 1
+                self._seed_note(prior["cfg"], exc)
                 continue
             if not dists:
                 continue
@@ -432,11 +658,20 @@ class Sweeper:
                 ))
             except Exception as exc:  # noqa: BLE001 - a bad prior must not stop the sweep
                 self.priors_skipped += 1
-                print(f"note: prior {prior['cfg']} cannot seed the study ({exc})",
-                      file=sys.stderr)
+                self._seed_note(prior["cfg"], exc)
                 continue
             added += 1
+        if self.priors_skipped > _SEED_NOTE_LIMIT:
+            print(f"note: {self.priors_skipped} priors in total are outside the grid this "
+                  f"run searches; only the first {self.seed_notes} are listed",
+                  file=sys.stderr)
         return added
+
+    def _seed_note(self, cfg: dict[str, object], exc: Exception) -> None:
+        """Why a prior could not seed the study, at most _SEED_NOTE_LIMIT times."""
+        if self.seed_notes < _SEED_NOTE_LIMIT:
+            print(f"note: prior {cfg} cannot seed the study ({exc})", file=sys.stderr)
+            self.seed_notes += 1
 
     # ---- the outputs -----------------------------------------------------------
     def write_csv(self) -> Path:
@@ -445,21 +680,23 @@ class Sweeper:
             f"bayesian-{self.hw.slug()}-{self.model}-{self.args.objective}-{utc_stamp()}.csv")
         with out.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=list(ROW_COLUMNS) + [
-                "gen_tok_s", "prefill_tok_s", "latency_ms", "prompt_ms", "decode_ms",
-                "generated", "prompt_tokens", "score", "note"])
+                "decode_tok_s", "thinking_tok_s", "answer_tok_s", "prefill_tok_s",
+                "latency_ms", "prompt_ms", "decode_ms", "think_ms", "answer_ms",
+                "generated", "prompt_tokens", "score", "note"] + list(TRANSFER_COLUMNS))
             writer.writeheader()
             for row in self.rows:
                 writer.writerow(row.csv_row())
         return out
 
     def winner_args(self) -> list[str]:
-        if not self.best_row:
+        best = self.winner()
+        if not best:
             return []
-        return engine_args(self.best_row.cfg, self.paths.as_dict(), self.args.cntx,
-                           self.args.max_new, draft_floor_of(self.args))
+        return engine_args(best.cfg, self.paths.as_dict(), self.args.cntx,
+                          self.args.max_new, draft_floor_of(self.args))
 
     def record(self, csv_path: Path) -> dict[str, Any]:
-        best = self.best_row
+        best = self.winner()
         measured = sum(1 for r in self.rows if r.metrics.ok())
         failed = sum(1 for r in self.rows if not r.metrics.ok() and r.metrics.status != "DRY")
         return {
@@ -475,13 +712,33 @@ class Sweeper:
             "spec_min_p": (best.cfg.get("draft_floor") if best else None) or draft_floor_of(self.args),
             "best": dict(best.cfg) if best else {},
             "metrics": {
-                "gen_tok_s": best.metrics.gen_tok_s if best else 0.0,
+                "decode_tok_s": best.metrics.decode_tok_s if best else 0.0,
+                "thinking_tok_s": best.metrics.thinking_tok_s if best else 0.0,
+                "answer_tok_s": best.metrics.answer_tok_s if best else 0.0,
                 "prefill_tok_s": best.metrics.prefill_tok_s if best else 0.0,
                 "latency_ms": best.metrics.latency_ms if best else 0.0,
                 "prompt_ms": best.metrics.prompt_ms if best else 0.0,
                 "decode_ms": best.metrics.decode_ms if best else 0.0,
+                "think_ms": best.metrics.think_ms if best else 0.0,
+                "answer_ms": best.metrics.answer_ms if best else 0.0,
             },
             "effective": best.metrics.effective if best else {},
+            # What the winning numbers were measured with. A tok/s from one sweep is not
+            # comparable with a tok/s from another: the same configuration on a different
+            # prompt, context or engine binary is a different number.
+            "conditions": {
+                "engine": str(self.args.engine),
+                "prompt_tokens": len(self.prompt_ids),
+                "max_new": self.args.max_new,
+                "context": self.args.cntx,
+                "repeat": self.args.repeat,
+                # The reasoning split only exists when the request asked for one.
+                "think_budget": self.args.think_budget,
+                "think_end": self.args.think_end if self.args.think_budget > 0 else None,
+            },
+            # The best prior this machine has ever recorded. Kept so a run can be compared
+            # with the numbers it started from; it is never the winner.
+            "prior_best": self.incumbent.to_dict() if self.incumbent else None,
             # A winner is only a winner if a boot produced tokens. A run that booted
             # nothing (GPU busy, --dry-run) has a best_row but no measurement; a prior
             # carried in from history is a measurement taken by an earlier sweep.
@@ -505,8 +762,10 @@ class Sweeper:
                 "file": str(self.args.history_file or history_path(
                     self.args.history_dir, self.model, self.args.objective,
                     self.args.cntx, self.hw)),
-                "trials_loaded": len(self.priors),
+                "trials_loaded": self.priors_loaded,
                 "priors_skipped": self.priors_skipped,
+                "priors_merged": self.priors_merged,
+                "priors_used": len(self.priors),
                 "reused": sum(1 for r in self.rows if r.from_history),
                 "duplicates_skipped": self.duplicates_skipped,
             },
@@ -521,11 +780,12 @@ class Sweeper:
         return out
 
     def write_deliverables(self, record: dict[str, Any]) -> tuple[Path, Path]:
-        """Write run-maya-<model>.sh and maya-<model>.json in the project's run-config format.
+        """Write max_<model>_run.sh and max_<model>_config.json in the project's run-config format.
 
-        A root-level launcher left by an earlier sweep may belong to another user; a
-        PermissionError there must not throw away a finished sweep, so the pair falls
-        back to the results directory and the fallback is printed.
+        The model's own launcher and config are never written; a sweep only ever adds files
+        under its own names. A root-level launcher left by an earlier sweep may belong to
+        another user; a PermissionError there must not throw away a finished sweep, so the
+        pair falls back to the results directory and the fallback is printed.
         """
         return write_run_pair(
             self.model, self.paths.as_dict(), self.winner_args(), record,
@@ -542,15 +802,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--model", default="maya-s24",
                    help="the model to tune (maya-s24, maya-s, maya-m); names the deliverables")
     metric = p.add_mutually_exclusive_group()
-    metric.add_argument("--gen", action="store_const", const="gen", dest="objective",
-                       help="maximise generation tokens/s")
+    metric.add_argument("--decode", action="store_const", const="decode", dest="objective",
+                       help="maximise decode tokens/s (every token the request generates)")
+    metric.add_argument("--gen", action="store_const", const="decode", dest="objective",
+                       help="alias for --decode; the name older scripts use")
+    metric.add_argument("--think", action="store_const", const="think", dest="objective",
+                       help="maximise thinking tokens/s - the reasoning block alone, which "
+                            "needs --think-budget")
     metric.add_argument("--prefill", action="store_const", const="prefill", dest="objective",
                        help="maximise prefill tokens/s")
     metric.add_argument("--latency", action="store_const", const="latency", dest="objective",
                        help="minimise prompt_ms + decode_ms")
+    metric.add_argument("--balance", action="store_const", const="balance", dest="objective",
+                       help="maximise decode tokens/s discounted by the share of a token "
+                            "the engine spent on the SSD and the CPU lane (its glm stat "
+                            "line). Finds the configuration that is fast and resident, not "
+                            "just fast.")
     p.add_argument("--objective", choices=OBJECTIVES, default=None,
                    help="same as the metric flag above; the flag wins")
-    p.add_argument("--cntx", "--context", type=int, default=131072, dest="cntx",
+    p.add_argument("--think-budget", type=int, default=0,
+                   help="tokens the request may reason before answering (GEN key "
+                        "think_budget); 0 sends no thinking keys. --think needs one.")
+    p.add_argument("--think-end", type=int, default=151667,
+                   help="the pack's think-end token id, the token the engine forces when a "
+                        "reasoning block closes (the pack's <|im_start|>)")
+    p.add_argument("--cntx", "--context", type=int, default=32768, dest="cntx",
                    help="context length the sweep is tuned at")
     p.add_argument("--trials", type=int, default=40,
                    help="unseen configurations to evaluate; repeats of a point already "
@@ -563,7 +839,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-new", type=int, default=512, help="tokens generated per request")
     p.add_argument("--prompt-tokens", type=int, default=10240,
                    help="prompt length; >8192 is needed for the tail arm to differ")
-    p.add_argument("--prompt-tokens-file", default=None, help="file of token ids to cycle")
+    p.add_argument("--prompt-tokens-file", default=None,
+                   help="file of token ids to cycle; without one the pack's own tokenizer "
+                        "is used on the benchmark prompt")
+    p.add_argument("--prompt-file", default=None,
+                   help="token-id JSON, or a text prompt rendered through the model's chat "
+                        "template and tokenized when a tokenizer is available")
+    p.add_argument("--two-stage", action="store_true",
+                   help="boot the engine once per topology and sweep per-request keys inside "
+                        "that session (pcie_frac, spec_min_p, and --request-dims)")
+    p.add_argument("--request-dims", default="cpu_threads,read_chunks,spec,spec_n_min",
+                   help="extra per-request dimensions to sweep with --two-stage; empty string "
+                        "keeps only the existing pcie/draft-floor request keys")
+    p.add_argument("--quasi-trials", type=int, default=15,
+                   help="Latin-hypercube trials seeded before TPE; 0 disables")
+    p.add_argument("--no-quasi", action="store_true", help="do not seed a quasi-random sweep")
     p.add_argument("--vram-min", type=int, default=256)
     p.add_argument("--vram-max", type=int, default=1536)
     p.add_argument("--vram-step", type=int, default=256)
@@ -591,6 +881,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--draft-floor", "--spec-min-p", type=float, default=None,
                    dest="draft_floor",
                    help="hold --spec-min-p at this value (0.001-1) instead of searching it")
+    p.add_argument("--ple-inflight", type=int, default=None, dest="ple_inflight",
+                   help="hold --ple-inflight (outstanding PLE reads, 1-1024) at this value "
+                        "instead of searching it")
+    p.add_argument("--suffix-draft", type=int, default=None, dest="suffix_draft",
+                   help="hold --suffix-draft (prompt-lookup drafting, 0 = off) at this value; "
+                        "only searched when no --dflash drafter was found")
+    p.add_argument("--mtp-max-t", type=int, default=None, dest="mtp_max_t",
+                   help="hold --mtp-max-t (the MTP draft window cap, 0 = as --spec gives) at "
+                        "this value; only searched when no --dflash drafter was found")
+    p.add_argument("--parallel", type=int, default=None,
+                   help="hold --parallel (conversations decoded at once, 1-8) at this value; "
+                        "a GLM-pack dimension - the qwen session has one sequence state")
     p.add_argument("--engine", default=None,
                    help="the engine binary to boot; default the one this project built "
                         "(build/strata, build-hip/strata)")
@@ -612,11 +914,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--history-dir", default=str(Path(__file__).resolve().parent / "history"),
                    help="where run data keyed to this machine is kept")
     p.add_argument("--replay", default=None,
-                   help="re-emit run-maya-<model>.sh/.json from a stored record without "
-                        "booting the engine (HyperCore-Tune-Maya/results/maya-<model>.record.json)")
+                   help="re-emit max_<model>_run.sh/_config.json from a stored record "
+                        "without booting the engine "
+                        "(HyperCore-Tune-Maya/results/maya-<model>.record.json)")
     p.add_argument("--from-records", action="store_true",
-                   help="rebuild run-maya-<model>.sh/.json from the best measured trial in "
-                        "the CSVs under --results-dir, without running a sweep")
+                   help="rebuild max_<model>_run.sh/_config.json from the best measured "
+                        "trial in the CSVs under --results-dir, without running a sweep")
     p.add_argument("--history-file", default=None,
                    help="load run data from this file instead of the machine-matched one")
     p.add_argument("--no-load", action="store_true",
@@ -628,13 +931,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         "probing the host (for tests, containers, and a farm of boxes)")
     p.add_argument("--dry-run", action="store_true", help="print the command lines, launch nothing")
     p.add_argument("--no-deliverables", action="store_true",
-                   help="write only the CSV; skip run-maya-<model>.sh/.json")
+                   help="write only the CSV; skip max_<model>_run.sh/_config.json")
     p.add_argument("--deliverable-dir", default=None,
-                   help="where run-maya-<model>.sh/.json go; default the Maya root")
+                   help="where max_<model>_run.sh/_config.json go; default the Maya root")
     p.add_argument("--port", type=int, default=None,
                    help="port the generated launcher uses; default the model config's, else 8081")
     p.add_argument("--no-browser", action="store_true",
                    help="the generated launcher leaves out --open")
+    p.add_argument("--no-preflight", action="store_true",
+                   help="skip the free-VRAM check that runs before the first trial")
     args = p.parse_args(argv)
     if args.maya_root:
         pinned = abs_path(args.maya_root)
@@ -658,13 +963,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.engine = engine_binary(root) or str(fallback)
     args.engine = str(abs_path(args.engine) or Path(args.engine).expanduser().resolve())
     if not args.objective:
-        args.objective = "gen"
+        args.objective = "decode"
+    args.objective = LEGACY_OBJECTIVE.get(args.objective, args.objective)
+    if args.think_budget < 0:
+        p.error("--think-budget cannot be negative")
+    if args.think_end < 0:
+        p.error("--think-end is a token id and cannot be negative")
+    if args.objective == "think" and args.think_budget == 0:
+        p.error("--think measures the reasoning block, so it needs --think-budget N; "
+               "without a budget the request has no reasoning block to measure")
     args.layers = [x.strip() for x in args.layers.split(",")] if args.layers else list(LAYERS)
     args.results_dir = Path(args.results_dir)
     args.history_dir = Path(args.history_dir)
     args.deliverable_dir = Path(args.deliverable_dir) if args.deliverable_dir else root
     if args.trials < 1:
         p.error("--trials must be at least 1")
+    if args.no_quasi:
+        args.quasi_trials = 0
+    args.quasi_trials = max(0, min(args.quasi_trials, args.trials))
+    args.request_dims = tuple(
+        x.strip() for x in args.request_dims.split(",") if x.strip()
+    ) if args.two_stage else ()
+    unknown = [x for x in args.request_dims if x not in REQUEST_DIMS]
+    if unknown:
+        p.error(f"--request-dims accepts only {', '.join(REQUEST_DIMS)}")
     args.trials_per_layer = max(2, args.trials // max(1, len(args.layers)))
     args.frozen = frozen_from_args(args)
     return args
@@ -692,8 +1014,16 @@ def best_from_records(results_dir: Path, model: str, objective: str) -> TrialRow
     is backed by a number.
     """
     best: TrialRow | None = None
-    pattern = f"bayesian-*{model}-{objective}-*.csv"
-    for csv_path in sorted(results_dir.glob(pattern)):
+    # The CSV name carries the model slug as the sweep wrote it, which is normally
+    # lowercase but is not always; match either spelling. A CSV written before the metric
+    # was named decode carries "gen", so both spellings are looked for.
+    needle = str(model).lower()
+    names = {objective} | {alias for alias, canonical in LEGACY_OBJECTIVE.items()
+                           if canonical == objective}
+    for csv_path in sorted(results_dir.glob("bayesian-*.csv")):
+        name = csv_path.name.lower()
+        if needle not in name or not any(f"-{alias}-" in name for alias in names):
+            continue
         try:
             rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
         except OSError as exc:
@@ -705,11 +1035,15 @@ def best_from_records(results_dir: Path, model: str, objective: str) -> TrialRow
             try:
                 metrics = Metrics(
                     status="PASS",
-                    gen_tok_s=float(raw.get("gen_tok_s") or 0.0),
+                    decode_tok_s=float(raw.get("decode_tok_s") or raw.get("gen_tok_s") or 0.0),
+                    thinking_tok_s=float(raw.get("thinking_tok_s") or 0.0),
+                    answer_tok_s=float(raw.get("answer_tok_s") or 0.0),
                     prefill_tok_s=float(raw.get("prefill_tok_s") or 0.0),
                     latency_ms=float(raw.get("latency_ms") or 0.0),
                     prompt_ms=float(raw.get("prompt_ms") or 0.0),
                     decode_ms=float(raw.get("decode_ms") or 0.0),
+                    think_ms=float(raw.get("think_ms") or 0.0),
+                    answer_ms=float(raw.get("answer_ms") or 0.0),
                     generated=int(raw.get("generated") or 0),
                     prompt_tokens=int(raw.get("prompt_tokens") or 0),
                 )
@@ -738,7 +1072,7 @@ def best_from_records(results_dir: Path, model: str, objective: str) -> TrialRow
 
 def rebuild_from_records(args: argparse.Namespace, paths: ModelPaths, hw: Hardware) -> int:
     """Write the deliverable pair from measured trials already on disk. No engine boots."""
-    row = best_from_records(Path(args.results_dir), args.model, args.objective)
+    row = best_from_records(Path(args.results_dir), args.model.lower(), args.objective)
     if row is None:
         raise SystemExit(
             f"HyperCore-Tune-Maya: no measured (status PASS) trial for model {args.model} "
@@ -758,13 +1092,25 @@ def rebuild_from_records(args: argparse.Namespace, paths: ModelPaths, hw: Hardwa
         "spec_min_p": row.cfg.get("draft_floor", draft_floor_of(args)),
         "best": dict(row.cfg),
         "metrics": {
-            "gen_tok_s": row.metrics.gen_tok_s,
+            "decode_tok_s": row.metrics.decode_tok_s,
+            "thinking_tok_s": row.metrics.thinking_tok_s,
+            "answer_tok_s": row.metrics.answer_tok_s,
             "prefill_tok_s": row.metrics.prefill_tok_s,
             "latency_ms": row.metrics.latency_ms,
             "prompt_ms": row.metrics.prompt_ms,
             "decode_ms": row.metrics.decode_ms,
+            "think_ms": row.metrics.think_ms,
+            "answer_ms": row.metrics.answer_ms,
         },
         "effective": row.metrics.effective,
+        "conditions": {
+            "engine": str(args.engine),
+            "prompt_tokens": row.metrics.prompt_tokens,
+            "max_new": args.max_new,
+            "context": args.cntx,
+            "repeat": args.repeat,
+        },
+        "prior_best": None,
         "verified": True,
         "args": engine,
         "study": {"mode": "records", "sampler": "none", "seed": args.seed,
@@ -783,8 +1129,11 @@ def rebuild_from_records(args: argparse.Namespace, paths: ModelPaths, hw: Hardwa
     print(f"rebuilt from measured records -> {sh}")
     print(f"                             {cfg}")
     print(f"  winner {json.dumps(row.cfg)}")
-    print(f"  gen {row.metrics.gen_tok_s:.2f} tok/s, prefill {row.metrics.prefill_tok_s:.2f} "
-          f"tok/s, latency {row.metrics.latency_ms:.1f} ms ({args.objective})")
+    print(f"  decode {row.metrics.decode_tok_s:.2f} tok/s, prefill {row.metrics.prefill_tok_s:.2f} "
+          f"tok/s, latency {row.metrics.latency_ms:.1f} ms"
+          + (f", thinking {row.metrics.thinking_tok_s:.2f} tok/s"
+             if row.metrics.thinking else "")
+          + f" ({args.objective})")
     return 0
 
 
@@ -825,6 +1174,31 @@ def replay(record_path: Path, args: argparse.Namespace, paths: ModelPaths,
     return 0
 
 
+def preflight(args: argparse.Namespace, paths: ModelPaths, hw: Hardware) -> None:
+    """Say before the first boot whether the GPU can host this pack.
+
+    A pack that cannot load fails every trial the same way, and a failed trial scores
+    PENALTY - the same 0.0 as a real zero throughput - so fifty of them teach the sampler
+    nothing and cost fifty boots. The pack's dense pool is the floor: the engine loads it
+    into a device arena before it sizes the expert pool from the VRAM left over
+    (glm_model.cu:1237), so below it no configuration in the grid runs at any setting.
+    """
+    if args.dry_run or args.no_preflight:
+        return
+    if str(args.engine).lower().endswith(".py"):
+        return  # the stand-in engine in the test suite needs no GPU
+    floor = pack_vram_floor_mib(paths.pack)
+    free = free_vram_mib() if floor > 0 else 0
+    if floor <= 0 or free <= 0:
+        return  # nothing to check: an unreadable pack, or no nvidia-smi on this box
+    if free < floor:
+        raise SystemExit(
+            f"HyperCore-Tune-Maya: {paths.pack} needs at least {floor} MiB of VRAM for its "
+            f"dense pool and only {free} MiB is free. Stop the engine holding the GPU, or "
+            f"run this with --no-preflight."
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     root = args.root
@@ -846,18 +1220,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths.pack = args.pack
     if args.dflash:
         paths.dflash = args.dflash
+    if args.prompt_file:
+        args.prompt_tokens_file = args.prompt_file
+        paths.prompt_tokens = args.prompt_file
     if args.prompt_tokens_file:
         paths.prompt_tokens = args.prompt_tokens_file
-    if not paths.prompt_tokens:
+    prompt_is_text = Path(args.prompt_tokens_file or "").suffix.lower() in {".txt", ".md", ".text"}
+    if not paths.prompt_tokens and not prompt_is_text and not paths.tokenizer:
         raise SystemExit(
-            "HyperCore-Tune-Maya: no prompt token file found. Pass --prompt-tokens-file "
-            "<json with an 'input' list>; fixtures/prompt.json in this repository is the "
-            "bundled one."
+            "HyperCore-Tune-Maya: no prompt source found. A tokenizer beside the pack is "
+            "enough - otherwise pass --prompt-tokens-file <json with an 'input' list> or "
+            "--prompt-file <text>."
         )
-    args.prompt_tokens_file = paths.prompt_tokens
+    args.prompt_tokens_file = paths.prompt_tokens or args.prompt_tokens_file
 
     params = build_space(vram_low=args.vram_min, vram_high=args.vram_max, vram_step=args.vram_step,
-                        max_workers=args.max_workers)
+                        max_workers=args.max_workers, pack=paths.pack,
+                        has_drafter=bool(paths.dflash),
+                        request_dims=args.request_dims)
+    allowed_kv = kv_modes_for(paths.pack)
+    if args.kv and args.kv not in allowed_kv:
+        raise SystemExit(
+            f"HyperCore-Tune-Maya: --kv {args.kv} is not implemented by the "
+            f"{pack_kind(paths.pack)} runner for {paths.pack}; use one of {allowed_kv}")
     frozen = dict(args.frozen)
     for p in params:
         if p.key not in frozen:
@@ -898,7 +1283,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if record:
                 fill = record.get("spec_min_p")
                 priors.extend(usable_trials(
-                    record, args.max_new, 0.8 if fill is None else float(fill)))
+                    record, args.max_new, 0.8 if fill is None else float(fill),
+                    pack=paths.pack))
         if priors:
             print(f"history: {len(priors)} configurations from "
                   f"{', '.join(str(s) for s in sources)}")
@@ -914,6 +1300,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"pack:   {paths.pack}")
     if frozen:
         print("frozen: " + ", ".join(f"{k}={v}" for k, v in frozen.items()))
+    preflight(args, paths, hw)
 
     sweeper = Sweeper(args, root, params, paths, hw, priors)
     t0 = time.monotonic()
@@ -933,7 +1320,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"{record['history']['duplicates_skipped']} duplicate suggestions skipped)")
 
     if not args.no_deliverables:
-        if not sweeper.best_row:
+        winner = sweeper.winner()
+        if winner is None:
             print("no configuration was evaluated; nothing written", file=sys.stderr)
             return 1
         if not record["verified"]:
@@ -947,11 +1335,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         args.deliverable_dir.mkdir(parents=True, exist_ok=True)
         sh_path, json_path = sweeper.write_deliverables(record)
-        print(f"\nwinner: {json.dumps(sweeper.best_row.cfg)}")
-        print(f"score:  {sweeper.best_row.score:.4f} ({args.objective}) "
-              f"gen {sweeper.best_row.metrics.gen_tok_s:.2f} tok/s, "
-              f"prefill {sweeper.best_row.metrics.prefill_tok_s:.2f} tok/s, "
-              f"latency {sweeper.best_row.metrics.latency_ms:.1f} ms")
+        booted = sum(1 for r in sweeper.rows if not r.from_history and r.metrics.ok())
+        print(f"\nwinner: {json.dumps(winner.cfg)}")
+        print(f"score:  {winner.score:.4f} ({args.objective}) "
+              f"decode {winner.metrics.decode_tok_s:.2f} tok/s, "
+              f"prefill {winner.metrics.prefill_tok_s:.2f} tok/s, "
+              f"latency {winner.metrics.latency_ms:.1f} ms"
+              + (f", thinking {winner.metrics.thinking_tok_s:.2f} tok/s "
+                 f"({winner.metrics.thinking_tokens} reasoning tokens over "
+                 f"{winner.metrics.think_ms:.0f} ms)"
+                 if winner.metrics.thinking else ""))
+        if winner.metrics.transfer:
+            t = winner.metrics.transfer
+            print(f"bus:    {t['transfer_share']:.1%} of a token is off-card time "
+                  f"({t['off_card_ms_per_tok']:.2f} ms/tok)"
+                  + (f" - measured by the engine: {t['disk_ms_per_tok']:.2f} ms SSD, "
+                     f"{t['cpu_ms_per_tok']:.2f} ms CPU lane" if t["measured_times"] else "")
+                  + (f"; {t['disk_reads_per_tok']:.2f} reads/tok at "
+                     f"{t['disk_ms_per_read']:.2f} ms each, "
+                     f"{t['disk_bytes_per_s'] / 1e6:.0f} MB/s"
+                     if t.get("disk_ms_per_read") else "")
+                  + (f" - the card alone could do {t['compute_tok_s']:.1f} tok/s"
+                     if t["compute_tok_s"] > winner.metrics.decode_tok_s else ""))
+            for flag in t.get("flags", []):
+                print(f"  ! {flag}")
+            lines = frontier([row.csv_row() for row in sweeper.rows])
+            if len(lines) > 1:
+                print("frontier: configurations nothing else beats on both rate and bus")
+                for line in lines:
+                    print(line)
+        if winner.from_history:
+            print("note: this configuration was carried in from history; nothing was "
+                  "booted in this run, so these numbers are not from this sweep")
+        else:
+            print(f"measured here: {booted} configurations booted, "
+                  f"prompt {len(sweeper.prompt_ids)} tokens, max_new {args.max_new}, "
+                  f"context {args.cntx}, engine {args.engine}")
+        prior = sweeper.incumbent
+        if prior is not None and prior is not winner and prior.score > winner.score:
+            print(f"prior best on this machine, not reproduced: score {prior.score:.4f} "
+                  f"decode {prior.metrics.decode_tok_s:.2f} tok/s "
+                  f"(measured by {prior.engine or 'an unknown engine'}; "
+                  "different engine or prompt, so not comparable)")
         print(f"wrote  {sh_path}")
         print(f"wrote  {json_path}")
 

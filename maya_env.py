@@ -181,8 +181,9 @@ def engine_binary(root: Path | None = None) -> str:
     root = root or maya_root()
     pinned = next((os.environ.get(name) for name in ENGINE_ENV if os.environ.get(name)), "")
     if pinned:
-        found = abs_path(pinned)
-        return str(found) if found is not None else str(Path(os.path.expandvars(pinned)).expanduser())
+        # abs_path expands ~ and %VAR% and resolves: an engine pinned as "build/strata"
+        # is still handed to the sweep as an absolute path.
+        return str(abs_path(pinned) or Path(pinned).expanduser().resolve())
     for rel in ENGINE_CANDIDATES:
         cand = root / rel
         if _is_runnable(cand):
@@ -336,18 +337,34 @@ def describe() -> dict[str, str]:
     }
 
 
-def data_roots(root: Path | None = None) -> tuple[str, ...]:
-    """Model data folders in the order Maya's installer would use them.
+def _data_tier(path: Path, base: Path) -> int:
+    """Which data folder the Maya engine should be pointed at first.
 
-    Order: $MAYA_DATA, the `data_dir` recorded in the user's settings, a data folder next
-    to the checkout (Maya-data, strata-data, ...), then any sibling data folder. Only
-    folders that exist and hold a models/ or packs/ directory are returned. Folders
-    inside the running user's home come first. Never raises.
+    0: a folder named after the project (Maya-data) - the one Maya's installer writes.
+    1: a legacy name left over from an earlier release (Strata-data, HyperCore-data).
+    2: anything else that ends in -data.
+    """
+    name = path.name.lower()
+    if name.startswith("maya-data") or "maya-data" in name:
+        return 0
+    if name.startswith(("strata-data", "hypercore-data")):
+        return 1
+    return 2
+
+
+def data_roots(root: Path | None = None) -> tuple[str, ...]:
+    """Model data folders in the order the Maya engine should search them.
+
+    Order: $MAYA_DATA / $PROJECT_MAYA_DATA, then the data folder beside the checkout named
+    after the project (Maya-data), then one the installer recorded in the project settings,
+    then a legacy-named folder (strata-data, hypercore-data), then any other sibling data
+    folder. Only folders that exist and hold a models/ or packs/ directory are returned.
+    Folders inside the running user's home come before another user's. Never raises.
     """
     root = root or maya_root()
-    pinned = [os.environ.get(name, "") for name in DATA_ENV] + [settings_data_dir()]
-    discovered: list[str] = []
+    pinned = [os.environ.get(name, "") for name in DATA_ENV]
     base = abs_path(root) or Path(root).resolve()
+    discovered: list[Path] = []
     for parent in dict.fromkeys((base.parent, base.parent.parent)):
         try:
             entries = list(parent.iterdir())
@@ -357,12 +374,15 @@ def data_roots(root: Path | None = None) -> tuple[str, ...]:
             name = d.name.lower()
             if d.is_dir() and (name.startswith(("maya-data", "strata-data", "hypercore-data"))
                                or name.endswith("-data")):
-                discovered.append(str(d.resolve()))
+                discovered.append(d.resolve())
+    remembered = abs_path(settings_data_dir())
+    if remembered is not None:
+        discovered.append(remembered)
     home = str(Path.home())
-    discovered.sort(key=lambda r: (not r.startswith(home), r))
+    discovered.sort(key=lambda p: (_data_tier(p, base), not str(p).startswith(home), str(p)))
 
     ordered: list[str] = []
-    for raw in pinned + discovered:
+    for raw in pinned + [str(p) for p in discovered]:
         if not raw:
             continue
         p = abs_path(raw)
